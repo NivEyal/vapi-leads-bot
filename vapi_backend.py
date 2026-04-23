@@ -61,12 +61,18 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-creds = Credentials.from_service_account_file(
-    GOOGLE_SERVICE_ACCOUNT_FILE,
-    scopes=SCOPES
-)
-gs_client = gspread.authorize(creds)
-sheet = gs_client.open_by_key(GOOGLE_SHEETS_ID).sheet1
+try:
+    creds = Credentials.from_service_account_info(
+        google_service_account_info,
+        scopes=SCOPES
+    )
+
+    gs_client = gspread.authorize(creds)
+    sheet = gs_client.open_by_key(GOOGLE_SHEETS_ID).sheet1
+
+except Exception as e:
+    print("🔥 GOOGLE ERROR:", str(e))
+    sheet = None
 
 # =========================
 # Helpers
