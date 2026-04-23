@@ -77,6 +77,12 @@ except Exception as e:
 # =========================
 # Helpers
 # =========================
+@app.route("/", methods=["GET"])
+def home():
+    return {
+        "status": "server running",
+        "message": "Vapi backend is live"
+    }, 200
 INTEREST_KEYWORDS = [
     "כן",
     "מעוניין",
