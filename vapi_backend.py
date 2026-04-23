@@ -152,14 +152,22 @@ def home():
         "status": "server running",
         "message": "Vapi backend is live"
     }, 200
+
+
 @app.route("/webhooks/vapi", methods=["POST"])
 def vapi_webhook():
     if not is_authorized(request):
+        print("❌ UNAUTHORIZED")
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
+    print("🔥 FULL EVENT:", data)
+
     message = data.get("message", {})
     msg_type = message.get("type")
+    print("🔥 MESSAGE TYPE:", msg_type)
+
+    # המשך הקוד הקיים שלך...
 
     # ברירת מחדל
     if msg_type != "end-of-call-report":
