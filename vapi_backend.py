@@ -125,6 +125,21 @@ def is_authorized(req) -> bool:
 # =========================
 # Google TTS Endpoint
 # =========================
+@app.post("/webhooks/vapi")
+def vapi_webhook():
+    if not is_authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    message = data.get("message", {})
+    msg_type = message.get("type")
+
+    print("🔥 MESSAGE TYPE:", msg_type, flush=True)
+
+    if msg_type != "end-of-call-report":
+        return ("", 204)
+
+    return ("", 204)
 @app.post("/vapi-tts")
 def tts():
     data = request.json or {}
