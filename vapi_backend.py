@@ -125,7 +125,7 @@ def is_authorized(req) -> bool:
 # =========================
 # Google TTS Endpoint
 # =========================
-@app.post("vapi-tts")
+@app.post("/vapi-tts")
 def tts():
     data = request.json or {}
     text = data.get("text", "")
