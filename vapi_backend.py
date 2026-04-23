@@ -158,6 +158,38 @@ def tts():
 # =========================
 # Health
 # =========================
+@app.get("/test-tts")
+def test_tts():
+    if tts_client is None:
+        return {"ok": False, "error": "TTS not initialized"}, 500
+
+    try:
+        synthesis_input = texttospeech.SynthesisInput(
+            text="שלום, מדבר ניב. זה טסט למערכת."
+        )
+
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="he-IL",
+            name="he-IL-Wavenet-A"
+        )
+
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3
+        )
+
+        response = tts_client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
+
+        return send_file(
+            io.BytesIO(response.audio_content),
+            mimetype="audio/mpeg"
+        )
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
 @app.get("/healthz")
 def healthz():
     return {"ok": True}, 200
