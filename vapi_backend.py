@@ -77,12 +77,7 @@ except Exception as e:
 # =========================
 # Helpers
 # =========================
-@app.route("/", methods=["GET"])
-def home():
-    return {
-        "status": "server running",
-        "message": "Vapi backend is live"
-    }, 200
+
 INTEREST_KEYWORDS = [
     "כן",
     "מעוניין",
@@ -148,6 +143,12 @@ def is_authorized(req) -> bool:
 # =========================
 # Webhook from Vapi
 # =========================
+@app.route("/", methods=["GET"])
+def home():
+    return {
+        "status": "server running",
+        "message": "Vapi backend is live"
+    }, 200
 @app.route("/webhooks/vapi", methods=["POST"])
 def vapi_webhook():
     if not is_authorized(request):
