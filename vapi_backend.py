@@ -143,6 +143,9 @@ def is_authorized(req) -> bool:
 # =========================
 # Webhook from Vapi
 # =========================
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return {"ok": True}, 200
 @app.route("/", methods=["GET"])
 def home():
     return {
