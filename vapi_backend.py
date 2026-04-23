@@ -201,67 +201,57 @@ def home():
 # =========================
 # Webhook from Vapi
 # =========================
-@app.post("/webhooks/vapi")
-def vapi_webhook():
-    if not is_authorized(request):
-        return jsonify({"error": "unauthorized"}), 401
+@app.post("/tts")
+def tts():
+    if tts_client is None:
+        return {"ok": False, "error": "TTS not initialized"}, 500
+        return {"ok": False, "error": "Google TTS not connected"}, 500
 
     data = request.get_json(silent=True) or {}
     message = data.get("message", {})
-    msg_type = message.get("type")
 
-    if msg_type != "end-of-call-report":
-        return ("", 204)
+    if message.get("type") != "voice-request":
+        return {"ok": False, "error": "Invalid message type"}, 400
 
-    call = message.get("call", {}) or {}
-    artifact = message.get("artifact", {}) or {}
+    text = message.get("text", "")
+    sample_rate = int(message.get("sampleRate", 24000))
 
-    call_id = call.get("id", "")
-    phone_number = (
-        call.get("customer", {}).get("number")
-        or call.get("phoneNumber")
-        or ""
+    if not text:
+        return {"ok": False, "error": "Missing text"}, 400
+
+    voice_id = data.get("voiceId") or message.get("voiceId") or "he-IL-Wavenet-A"
+
+    synthesis_input = texttospeech.SynthesisInput(text=text)
+
+    voice = texttospeech.VoiceSelectionParams(
+        language_code="he-IL",
+        name=voice_id
     )
-    business_name = call.get("customer", {}).get("name", "") or ""
-    ended_reason = message.get("endedReason", "")
-    transcript = artifact.get("transcript", "") or ""
 
-    interested = is_interested(transcript)
-    answered = ended_reason not in ["customer-did-not-answer", "assistant-not-available"]
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+        sample_rate_hertz=sample_rate
+    )
 
-    summary = "הלקוח הביע עניין וביקש פרטים בוואטסאפ." if interested else "לא זוהה עניין ברור."
+    response = tts_client.synthesize_speech(
+        input=synthesis_input,
+        voice=voice,
+        audio_config=audio_config
+    )
 
-    whatsapp_sent = "no"
-    whatsapp_sid = ""
+    audio = response.audio_content
 
-    if interested and phone_number:
-        try:
-            whatsapp_sid = send_whatsapp(
-                to_phone=phone_number,
-                business_name=business_name,
-                summary="נשמח להמשך שיחה ותיאום."
-            )
-            whatsapp_sent = "yes"
-        except Exception as e:
-            whatsapp_sent = f"failed: {str(e)[:120]}"
+    # Google LINEAR16 לפעמים מחזיר WAV header. Vapi צריך Raw PCM בלי header.
+    if audio[:4] == b"RIFF":
+        data_index = audio.find(b"data")
+        if data_index != -1:
+            pcm_start = data_index + 8
+            audio = audio[pcm_start:]
 
-    row = [
-        datetime.utcnow().isoformat(),
-        call_id,
-        phone_number,
-        business_name,
-        "yes" if answered else "no",
-        "yes" if interested else "no",
-        summary,
-        transcript[:4000],
-        whatsapp_sent,
-        whatsapp_sid,
-        ended_reason,
-    ]
-    append_lead_row(row)
-
-    return ("", 204)
-
+    return Response(
+        audio,
+        mimetype="application/octet-stream"
+    )
 # =========================
 # Stats + Dashboard
 # =========================
