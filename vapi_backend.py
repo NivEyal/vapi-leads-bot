@@ -1,12 +1,19 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, send_file
 from datetime import datetime
 import os
 import re
+import io
+
+# Twilio
 from twilio.rest import Client
+
+# Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
-from flask import Response
-from google.oauth2.service_account import Credentials
+
+# Google Cloud TTS
+from google.cloud import texttospeech
+
 app = Flask(__name__)
 
 # =========================
@@ -14,13 +21,10 @@ app = Flask(__name__)
 # =========================
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")  # לדוגמה: whatsapp:+14155238886
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
 VAPI_WEBHOOK_SECRET = os.getenv("VAPI_WEBHOOK_SECRET")
 
-import os
-from google.oauth2.service_account import Credentials
-import gspread
-
+# Google Service Account
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -42,53 +46,31 @@ google_service_account_info = {
 
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
 
-creds = Credentials.from_service_account_info(
-    google_service_account_info,
-    scopes=SCOPES
-)
-
-gs_client = gspread.authorize(creds)
-sheet = gs_client.open_by_key(GOOGLE_SHEETS_ID).sheet1
-# =========================
-# Twilio client
-# =========================
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-# =========================
 # Google Sheets client
-# =========================
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
 try:
     creds = Credentials.from_service_account_info(
         google_service_account_info,
         scopes=SCOPES
     )
-
     gs_client = gspread.authorize(creds)
     sheet = gs_client.open_by_key(GOOGLE_SHEETS_ID).sheet1
-
 except Exception as e:
     print("🔥 GOOGLE ERROR:", str(e))
     sheet = None
+
+# Twilio client
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# Google TTS client
+tts_client = texttospeech.TextToSpeechClient()
 
 # =========================
 # Helpers
 # =========================
 
 INTEREST_KEYWORDS = [
-    "כן",
-    "מעוניין",
-    "תשלח",
-    "שלח לי",
-    "תשלחו",
-    "וואטסאפ",
-    "פרטים",
-    "אשמח",
-    "אשמח לקבל",
-    "דבר איתי",
+    "כן", "מעוניין", "תשלח", "שלח לי", "תשלחו",
+    "וואטסאפ", "פרטים", "אשמח", "אשמח לקבל", "דבר איתי"
 ]
 
 def is_interested(text: str) -> bool:
@@ -98,14 +80,11 @@ def is_interested(text: str) -> bool:
     return any(k.lower() in t for k in INTEREST_KEYWORDS)
 
 def normalize_phone_for_whatsapp(phone: str) -> str:
-    # אם כבר בפורמט whatsapp:+972...
     if phone.startswith("whatsapp:"):
         return phone
 
-    # ניקוי בסיסי
     digits = re.sub(r"[^\d+]", "", phone)
 
-    # אם מתחיל ב-0 ישראלי, נהפוך ל-972
     if digits.startswith("0"):
         digits = "+972" + digits[1:]
     elif not digits.startswith("+"):
@@ -114,7 +93,8 @@ def normalize_phone_for_whatsapp(phone: str) -> str:
     return f"whatsapp:{digits}"
 
 def append_lead_row(row: list):
-    sheet.append_row(row, value_input_option="USER_ENTERED")
+    if sheet:
+        sheet.append_row(row, value_input_option="USER_ENTERED")
 
 def send_whatsapp(to_phone: str, business_name: str = "", summary: str = ""):
     to_whatsapp = normalize_phone_for_whatsapp(to_phone)
@@ -132,44 +112,67 @@ def send_whatsapp(to_phone: str, business_name: str = "", summary: str = ""):
     )
     return msg.sid
 
-# =========================
-# Security
-# =========================
 def is_authorized(req) -> bool:
     auth_header = req.headers.get("Authorization", "")
     expected = f"Bearer {VAPI_WEBHOOK_SECRET}"
     return auth_header == expected
 
 # =========================
-# Webhook from Vapi
+# Google TTS Endpoint
 # =========================
-@app.route("/healthz", methods=["GET"])
+@app.post("/tts")
+def tts():
+    data = request.json or {}
+    text = data.get("text", "")
+    voice_id = data.get("voice", "he-IL-Wavenet-A")
+
+    synthesis_input = texttospeech.SynthesisInput(text=text)
+
+    voice = texttospeech.VoiceSelectionParams(
+        language_code="he-IL",
+        name=voice_id
+    )
+
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3
+    )
+
+    response = tts_client.synthesize_speech(
+        input=synthesis_input,
+        voice=voice,
+        audio_config=audio_config
+    )
+
+    return send_file(
+        io.BytesIO(response.audio_content),
+        mimetype="audio/mpeg",
+        as_attachment=False,
+        download_name="speech.mp3"
+    )
+
+# =========================
+# Health
+# =========================
+@app.get("/healthz")
 def healthz():
     return {"ok": True}, 200
-@app.route("/", methods=["GET"])
+
+@app.get("/")
 def home():
-    return {
-        "status": "server running",
-        "message": "Vapi backend is live"
-    }, 200
+    return {"status": "server running", "message": "Vapi backend is live"}, 200
 
-
-@app.route("/webhooks/vapi", methods=["POST"])
+# =========================
+# Webhook from Vapi
+# =========================
+@app.post("/webhooks/vapi")
 def vapi_webhook():
     if not is_authorized(request):
-        print("❌ UNAUTHORIZED")
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
-    print("🔥 FULL EVENT:", data)
-
     message = data.get("message", {})
     msg_type = message.get("type")
-    print("🔥 MESSAGE TYPE:", msg_type)
 
-    # המשך הקוד הקיים שלך...
-
-    # ברירת מחדל
     if msg_type != "end-of-call-report":
         return ("", 204)
 
@@ -194,7 +197,6 @@ def vapi_webhook():
     whatsapp_sent = "no"
     whatsapp_sid = ""
 
-    # שולחים וואטסאפ רק אם יש עניין
     if interested and phone_number:
         try:
             whatsapp_sid = send_whatsapp(
@@ -214,7 +216,7 @@ def vapi_webhook():
         "yes" if answered else "no",
         "yes" if interested else "no",
         summary,
-        transcript[:4000],   # כדי לא לפוצץ תא
+        transcript[:4000],
         whatsapp_sent,
         whatsapp_sid,
         ended_reason,
@@ -224,9 +226,9 @@ def vapi_webhook():
     return ("", 204)
 
 # =========================
-# Stats endpoint
+# Stats + Dashboard
 # =========================
-@app.route("/stats", methods=["GET"])
+@app.get("/stats")
 def stats():
     rows = sheet.get_all_records()
 
@@ -244,7 +246,8 @@ def stats():
         "interest_rate_from_total_pct": interest_rate_from_total,
         "interest_rate_from_answered_pct": interest_rate_from_answered,
     })
-@app.route("/dashboard", methods=["GET"])
+
+@app.get("/dashboard")
 def dashboard():
     rows = sheet.get_all_records()
 
@@ -285,156 +288,38 @@ def dashboard():
         <meta charset="utf-8">
         <title>Lead Dashboard</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background: #f5f7fb;
-                margin: 0;
-                padding: 24px;
-                color: #1f2937;
-            }}
-            .container {{
-                max-width: 1200px;
-                margin: 0 auto;
-            }}
-            h1 {{
-                margin-bottom: 8px;
-            }}
-            .sub {{
-                color: #6b7280;
-                margin-bottom: 24px;
-            }}
-            .grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-                gap: 16px;
-                margin-bottom: 24px;
-            }}
-            .card {{
-                background: white;
-                border-radius: 16px;
-                padding: 20px;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.06);
-            }}
-            .label {{
-                font-size: 14px;
-                color: #6b7280;
-                margin-bottom: 10px;
-            }}
-            .value {{
-                font-size: 30px;
-                font-weight: bold;
-            }}
-            .table-wrap {{
-                background: white;
-                border-radius: 16px;
-                padding: 20px;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.06);
-                overflow-x: auto;
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                font-size: 14px;
-            }}
-            th, td {{
-                text-align: right;
-                padding: 12px 10px;
-                border-bottom: 1px solid #e5e7eb;
-                vertical-align: top;
-            }}
-            th {{
-                background: #f9fafb;
-                position: sticky;
-                top: 0;
-            }}
-            .topbar {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                gap: 12px;
-                flex-wrap: wrap;
-                margin-bottom: 20px;
-            }}
-            .btn {{
-                display: inline-block;
-                text-decoration: none;
-                background: #111827;
-                color: white;
-                padding: 10px 14px;
-                border-radius: 10px;
-                font-size: 14px;
-            }}
-            .muted {{
-                color: #6b7280;
-                font-size: 13px;
-            }}
-        </style>
     </head>
     <body>
-        <div class="container">
-            <div class="topbar">
-                <div>
-                    <h1>דשבורד לידים</h1>
-                    <div class="sub">סטטוס שיחות, התעניינות ושליחת וואטסאפ</div>
-                </div>
-                <div>
-                    <a class="btn" href="/stats" target="_blank">JSON Stats</a>
-                </div>
-            </div>
-
-            <div class="grid">
-                <div class="card">
-                    <div class="label">סה״כ שיחות</div>
-                    <div class="value">{total}</div>
-                </div>
-                <div class="card">
-                    <div class="label">שיחות שנענו</div>
-                    <div class="value">{answered}</div>
-                </div>
-                <div class="card">
-                    <div class="label">מתעניינים</div>
-                    <div class="value">{interested}</div>
-                </div>
-                <div class="card">
-                    <div class="label">וואטסאפ נשלח</div>
-                    <div class="value">{whatsapp_sent}</div>
-                </div>
-                <div class="card">
-                    <div class="label">המרה מכלל השיחות</div>
-                    <div class="value">{conversion_total}%</div>
-                </div>
-                <div class="card">
-                    <div class="label">המרה מתוך מי שענה</div>
-                    <div class="value">{conversion_answered}%</div>
-                </div>
-            </div>
-
-            <div class="table-wrap">
-                <h2 style="margin-top:0;">20 הלידים האחרונים</h2>
-                <div class="muted" style="margin-bottom:12px;">חדש למעלה</div>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>זמן</th>
-                            <th>עסק</th>
-                            <th>טלפון</th>
-                            <th>ענה</th>
-                            <th>התעניין</th>
-                            <th>וואטסאפ</th>
-                            <th>סיבת סיום</th>
-                            <th>סיכום</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {table_rows if table_rows else '<tr><td colspan="8">אין נתונים עדיין</td></tr>'}
-                    </tbody>
-                </table>
-            </div>
-        </div>
+        <h1>דשבורד לידים</h1>
+        <p>סטטוס שיחות, התעניינות ושליחת וואטסאפ</p>
+        <p>סה״כ שיחות: {total}</p>
+        <p>שיחות שנענו: {answered}</p>
+        <p>מתעניינים: {interested}</p>
+        <p>וואטסאפ נשלח: {whatsapp_sent}</p>
+        <p>המרה מכלל השיחות: {conversion_total}%</p>
+        <p>המרה מתוך מי שענה: {conversion_answered}%</p>
+        <h2>20 הלידים האחרונים</h2>
+        <table border="1" cellpadding="6" cellspacing="0">
+            <tr>
+                <th>זמן</th>
+                <th>עסק</th>
+                <th>טלפון</th>
+                <th>ענה</th>
+                <th>התעניין</th>
+                <th>וואטסאפ</th>
+                <th>סיבת סיום</th>
+                <th>סיכום</th>
+            </tr>
+            {table_rows}
+        </table>
     </body>
     </html>
     """
+
     return Response(html, mimetype="text/html; charset=utf-8")
+
+# =========================
+# Run
+# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
