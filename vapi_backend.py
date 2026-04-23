@@ -201,7 +201,7 @@ def home():
 # =========================
 # Webhook from Vapi
 # =========================
-@app.post("/tts")
+@app.post("/vapi-tts")
 def tts():
     if tts_client is None:
         return {"ok": False, "error": "TTS not initialized"}, 500
