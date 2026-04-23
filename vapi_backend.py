@@ -62,8 +62,13 @@ except Exception as e:
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # Google TTS client
-tts_client = texttospeech.TextToSpeechClient()
-
+try:
+    tts_client = texttospeech.TextToSpeechClient.from_service_account_info(
+        google_service_account_info
+    )
+except Exception as e:
+    print("🔥 GOOGLE TTS ERROR:", str(e), flush=True)
+    tts_client = None
 # =========================
 # Helpers
 # =========================
