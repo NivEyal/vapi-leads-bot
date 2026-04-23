@@ -8,3 +8,4 @@ twilio
 gspread
 google-auth
 google
+google-cloud-texttospeech
