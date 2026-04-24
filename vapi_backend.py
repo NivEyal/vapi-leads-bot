@@ -3,7 +3,16 @@ from datetime import datetime
 import os
 import re
 import io
+from flask import Flask, request, jsonify, Response, send_file
+from datetime import datetime
+import os
+import re
+import io
 
+from twilio.rest import Client
+import gspread
+from google.oauth2.service_account import Credentials
+from google.cloud import texttospeech
 # Twilio
 from twilio.rest import Client
 
@@ -219,27 +228,48 @@ def home():
 @app.post("/vapi-tts")
 def vapi_tts():
     if tts_client is None:
-        return {"ok": False, "error": "TTS not initialized"}, 500
-        return {"ok": False, "error": "Google TTS not connected"}, 500
+        return Response(b"", mimetype="application/octet-stream")
 
     data = request.get_json(silent=True) or {}
-    message = data.get("message", {})
+    message = data.get("message", {}) or {}
 
-    if message.get("type") != "voice-request":
-        return {"ok": False, "error": "Invalid message type"}, 400
+    text = message.get("text") or data.get("text") or ""
+    sample_rate = int(message.get("sampleRate", 16000))
 
-    text = message.get("text", "")
-    sample_rate = int(message.get("sampleRate", 24000))
-from flask import Flask, request, jsonify, Response, send_file
-from datetime import datetime
-import os
-import re
-import io
+    if not text:
+        return Response(b"", mimetype="application/octet-stream")
 
-from twilio.rest import Client
-import gspread
-from google.oauth2.service_account import Credentials
-from google.cloud import texttospeech
+    try:
+        # ⚡ קיצור טקסט ראשון (קריטי)
+        text = text[:120]
+
+        response = tts_client.synthesize_speech(
+            input=texttospeech.SynthesisInput(text=text),
+            voice=texttospeech.VoiceSelectionParams(
+                language_code="he-IL",
+                name="he-IL-Wavenet-A",
+            ),
+            audio_config=texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+                sample_rate_hertz=sample_rate,
+            ),
+        )
+
+        audio = response.audio_content
+
+        if audio[:4] == b"RIFF":
+            data_index = audio.find(b"data")
+            if data_index != -1:
+                audio = audio[data_index + 8:]
+
+        return Response(audio, mimetype="application/octet-stream")
+
+    except Exception as e:
+        print("🔥 TTS ERROR:", str(e), flush=True)
+
+        # ❗ חשוב — לא להחזיר error, אלא silence
+        return Response(b"", mimetype="application/octet-stream")
+
 
 app = Flask(__name__)
 
