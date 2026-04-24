@@ -124,23 +124,62 @@ def is_authorized(req) -> bool:
     auth_header = req.headers.get("Authorization", "")
     expected = f"Bearer {VAPI_WEBHOOK_SECRET}"
     return auth_header == expected
+def fix_hebrew_tts(text: str) -> str:
+    # ניקוד חכם למילים בעייתיות בלבד (לא הכל!)
+    replacements = {
+        "שלום": "שָׁלוֹם",
+        "היי": "הַיי",
+        "מדבר": "מְדַבֵּר",
+        "ניב": "נִיב",
+        "תודה": "תוֹדָה",
+        "השיחה": "הַשִּׂיחָה",
+        "כמו שביקשת": "כְּמוֹ שֶׁבִּיקַּשְׁתָּ",
+        "הנה הפרטים": "הִנֵּה הַפְּרָטִים",
+        "להמשך": "לְהֶמְשֵׁךְ",
+        "תור": "תוֹר",
+        "לקביעת תור": "לִקְבִּיעַת תוֹר",
+        "שלחתי": "שָׁלַחְתִּי",
+        "לך": "לְךָ",
+        "וואטסאפ": "וָואטְסְאַפּ",
+        "נשמח": "נִשְׂמַח",
+        "להמשך שיחה": "לְהֶמְשֵׁךְ שִׂיחָה",
+        "ותיאום": "וְתִיאוּם",
+    }
 
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+
+    return text
 def azure_tts(text: str, voice: str = "he-IL-AvriNeural", output_format: str = "raw-16khz-16bit-mono-pcm") -> bytes:
     url = f"https://{AZURE_TTS_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
+
     headers = {
         "Ocp-Apim-Subscription-Key": AZURE_TTS_KEY,
         "Content-Type": "application/ssml+xml",
         "X-Microsoft-OutputFormat": output_format,
         "User-Agent": "vapi-tts",
     }
-    ssml = f"""<speak version='1.0' xml:lang='he-IL'>
-    <voice name='{voice}'>{text}</voice>
-</speak>"""
+
+    # 👉 ניקוד חכם
+    text = fix_hebrew_tts(text)
+
+    # 👉 SSML מקצועי (זה מה שמשפר באמת)
+    ssml = f"""
+    <speak version='1.0' xml:lang='he-IL'>
+        <voice name='{voice}'>
+            <prosody rate="0.95" pitch="+0%">
+                {text}
+            </prosody>
+        </voice>
+    </speak>
+    """
+
     res = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=8)
+
     if res.status_code != 200:
         raise RuntimeError(f"Azure TTS error {res.status_code}: {res.text}")
-    return res.content
 
+    return res.content
 # =========================
 # Health
 # =========================
