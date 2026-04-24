@@ -12,7 +12,7 @@ import io
 from twilio.rest import Client
 import gspread
 from google.oauth2.service_account import Credentials
-from google.cloud import texttospeech
+import azure.cognitiveservices.speech as speechsdk
 # Twilio
 from twilio.rest import Client
 
@@ -33,26 +33,12 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
 VAPI_WEBHOOK_SECRET = os.getenv("VAPI_WEBHOOK_SECRET")
 
-# Google Service Account
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+# הסר:
+# GOOGLE_* variables עבור TTS
 
-google_service_account_info = {
-    "type": os.getenv("GOOGLE_TYPE"),
-    "project_id": os.getenv("GOOGLE_PROJECT_ID"),
-    "private_key_id": os.getenv("GOOGLE_PRIVATE_KEY_I"),
-    "private_key": os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n"),
-    "client_email": os.getenv("GOOGLE_CLIENT_EMAIL"),
-    "client_id": os.getenv("GOOGLE_CLIENT_ID"),
-    "auth_uri": os.getenv("GOOGLE_AUTH_URI"),
-    "token_uri": os.getenv("GOOGLE_TOKEN_URI"),
-    "auth_provider_x509_cert_url": os.getenv("GOOGLE_AUTH_PROVIDER_X509_CERT_URL"),
-    "client_x509_cert_url": os.getenv("GOOGLE_CLIENT_X509_CERT_URL"),
-    "universe_domain": os.getenv("GOOGLE_UNIVERSE_DOMAIN", "googleapis.com"),
-}
-
+# הוסף:
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")  # למשל: "israelcentral" או "westeurope"
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
 
 # Google Sheets client
