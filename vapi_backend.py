@@ -3,274 +3,30 @@ from datetime import datetime
 import os
 import re
 import io
-from flask import Flask, request, jsonify, Response, send_file
-from datetime import datetime
-import os
-import re
-import io
+import requests
 
 from twilio.rest import Client
 import gspread
 from google.oauth2.service_account import Credentials
-import azure.cognitiveservices.speech as speechsdk
-# Twilio
-from twilio.rest import Client
 
-# Google Sheets
-import gspread
-from google.oauth2.service_account import Credentials
-
-# Google Cloud TTS
-from google.cloud import texttospeech
-
+# =========================
+# App
+# =========================
 app = Flask(__name__)
 
 # =========================
 # ENV
 # =========================
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
-VAPI_WEBHOOK_SECRET = os.getenv("VAPI_WEBHOOK_SECRET")
-
-# הסר:
-# GOOGLE_* variables עבור TTS
-
-# הוסף:
-AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
-AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")  # למשל: "israelcentral" או "westeurope"
-GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
-
-# Google Sheets client
-try:
-    creds = Credentials.from_service_account_info(
-        google_service_account_info,
-        scopes=SCOPES
-    )
-    gs_client = gspread.authorize(creds)
-    sheet = gs_client.open_by_key(GOOGLE_SHEETS_ID).sheet1
-except Exception as e:
-    print("🔥 GOOGLE ERROR:", str(e))
-    sheet = None
-
-# Twilio client
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-# Google TTS client
-try:
-    tts_client = texttospeech.TextToSpeechClient.from_service_account_info(
-        google_service_account_info
-    )
-except Exception as e:
-    print("🔥 GOOGLE TTS ERROR:", str(e), flush=True)
-    tts_client = None
-# =========================
-# Helpers
-# =========================
-
-INTEREST_KEYWORDS = [
-    "כן", "מעוניין", "תשלח", "שלח לי", "תשלחו",
-    "וואטסאפ", "פרטים", "אשמח", "אשמח לקבל", "דבר איתי"
-]
-
-def is_interested(text: str) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    return any(k.lower() in t for k in INTEREST_KEYWORDS)
-
-def normalize_phone_for_whatsapp(phone: str) -> str:
-    if phone.startswith("whatsapp:"):
-        return phone
-
-    digits = re.sub(r"[^\d+]", "", phone)
-
-    if digits.startswith("0"):
-        digits = "+972" + digits[1:]
-    elif not digits.startswith("+"):
-        digits = "+" + digits
-
-    return f"whatsapp:{digits}"
-
-def append_lead_row(row: list):
-    if sheet:
-        sheet.append_row(row, value_input_option="USER_ENTERED")
-
-def send_whatsapp(to_phone: str, business_name: str = "", summary: str = ""):
-    to_whatsapp = normalize_phone_for_whatsapp(to_phone)
-
-    body = (
-        f"היי{(' ' + business_name) if business_name else ''}, תודה על השיחה.\n"
-        f"כמו שביקשת, הנה הפרטים להמשך.\n"
-        f"{summary}"
-    )
-
-    msg = twilio_client.messages.create(
-        from_=TWILIO_WHATSAPP_FROM,
-        to=to_whatsapp,
-        body=body
-    )
-    return msg.sid
-
-def is_authorized(req) -> bool:
-    auth_header = req.headers.get("Authorization", "")
-    expected = f"Bearer {VAPI_WEBHOOK_SECRET}"
-    return auth_header == expected
-
-# =========================
-# Google TTS Endpoint
-# =========================
-@app.post("/webhooks/vapi")
-def vapi_webhook():
-    if not is_authorized(request):
-        return jsonify({"error": "unauthorized"}), 401
-
-    data = request.get_json(silent=True) or {}
-    message = data.get("message", {})
-    msg_type = message.get("type")
-
-    print("🔥 MESSAGE TYPE:", msg_type, flush=True)
-
-    if msg_type != "end-of-call-report":
-        return ("", 204)
-
-    return ("", 204)
-@app.post("/vapi-tts")
-def tts():
-    data = request.json or {}
-    text = data.get("text", "")
-    voice_id = data.get("voice", "he-IL-Wavenet-A")
-
-    synthesis_input = texttospeech.SynthesisInput(text=text)
-
-    voice = texttospeech.VoiceSelectionParams(
-        language_code="he-IL",
-        name=voice_id
-    )
-
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3
-    )
-
-    response = tts_client.synthesize_speech(
-        input=synthesis_input,
-        voice=voice,
-        audio_config=audio_config
-    )
-
-    return send_file(
-        io.BytesIO(response.audio_content),
-        mimetype="audio/mpeg",
-        as_attachment=False,
-        download_name="speech.mp3"
-    )
-
-# =========================
-# Health
-# =========================
-@app.get("/test-tts")
-def test_tts():
-    if tts_client is None:
-        return {"ok": False, "error": "TTS not initialized"}, 500
-
-    try:
-        synthesis_input = texttospeech.SynthesisInput(
-            text="שלום, מדבר ניב. זה טסט למערכת."
-        )
-
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="he-IL",
-            name="he-IL-Wavenet-A"
-        )
-
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3
-        )
-
-        response = tts_client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config
-        )
-
-        return send_file(
-            io.BytesIO(response.audio_content),
-            mimetype="audio/mpeg"
-        )
-
-    except Exception as e:
-        return {"ok": False, "error": str(e)}, 500
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}, 200
-
-@app.get("/")
-def home():
-    return {"status": "server running", "message": "Vapi backend is live"}, 200
-
-# =========================
-# Webhook from Vapi
-# =========================
-@app.post("/vapi-tts")
-def vapi_tts():
-    if tts_client is None:
-        return Response(b"", mimetype="application/octet-stream")
-
-    data = request.get_json(silent=True) or {}
-    message = data.get("message", {}) or {}
-
-    text = message.get("text") or data.get("text") or ""
-    sample_rate = int(message.get("sampleRate", 16000))
-
-    if not text:
-        return Response(b"", mimetype="application/octet-stream")
-
-    try:
-        # ⚡ קיצור טקסט ראשון (קריטי)
-        text = text[:120]
-
-        response = tts_client.synthesize_speech(
-            input=texttospeech.SynthesisInput(text=text),
-            voice=texttospeech.VoiceSelectionParams(
-                language_code="he-IL",
-                name="he-IL-Wavenet-A",
-            ),
-            audio_config=texttospeech.AudioConfig(
-                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-                sample_rate_hertz=sample_rate,
-            ),
-        )
-
-        audio = response.audio_content
-
-        if audio[:4] == b"RIFF":
-            data_index = audio.find(b"data")
-            if data_index != -1:
-                audio = audio[data_index + 8:]
-
-        return Response(audio, mimetype="application/octet-stream")
-
-    except Exception as e:
-        print("🔥 TTS ERROR:", str(e), flush=True)
-
-        # ❗ חשוב — לא להחזיר error, אלא silence
-        return Response(b"", mimetype="application/octet-stream")
-
-
-app = Flask(__name__)
-
-# =========================
-# ENV
-# =========================
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
-VAPI_WEBHOOK_SECRET = os.getenv("VAPI_WEBHOOK_SECRET")
-GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
+TWILIO_ACCOUNT_SID    = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN     = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_FROM  = os.getenv("TWILIO_WHATSAPP_FROM")
+VAPI_WEBHOOK_SECRET   = os.getenv("VAPI_WEBHOOK_SECRET")
+GOOGLE_SHEETS_ID      = os.getenv("GOOGLE_SHEETS_ID")
+AZURE_TTS_KEY         = os.getenv("AZURE_TTS_KEY")
+AZURE_TTS_REGION      = os.getenv("AZURE_TTS_REGION", "westeurope")
 
 # =========================
 # Google Service Account
-# שים לב: השארתי GOOGLE_PRIVATE_KEY_I כי אמרת שככה הגדרת ב-Render
 # =========================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -278,17 +34,17 @@ SCOPES = [
 ]
 
 google_service_account_info = {
-    "type": os.getenv("GOOGLE_TYPE"),
-    "project_id": os.getenv("GOOGLE_PROJECT_ID"),
-    "private_key_id": os.getenv("GOOGLE_PRIVATE_KEY_I"),
-    "private_key": os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n"),
-    "client_email": os.getenv("GOOGLE_CLIENT_EMAIL"),
-    "client_id": os.getenv("GOOGLE_CLIENT_ID"),
-    "auth_uri": os.getenv("GOOGLE_AUTH_URI"),
-    "token_uri": os.getenv("GOOGLE_TOKEN_URI"),
+    "type":                        os.getenv("GOOGLE_TYPE"),
+    "project_id":                  os.getenv("GOOGLE_PROJECT_ID"),
+    "private_key_id":              os.getenv("GOOGLE_PRIVATE_KEY_I"),
+    "private_key":                 os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n"),
+    "client_email":                os.getenv("GOOGLE_CLIENT_EMAIL"),
+    "client_id":                   os.getenv("GOOGLE_CLIENT_ID"),
+    "auth_uri":                    os.getenv("GOOGLE_AUTH_URI"),
+    "token_uri":                   os.getenv("GOOGLE_TOKEN_URI"),
     "auth_provider_x509_cert_url": os.getenv("GOOGLE_AUTH_PROVIDER_X509_CERT_URL"),
-    "client_x509_cert_url": os.getenv("GOOGLE_CLIENT_X509_CERT_URL"),
-    "universe_domain": os.getenv("GOOGLE_UNIVERSE_DOMAIN", "googleapis.com"),
+    "client_x509_cert_url":        os.getenv("GOOGLE_CLIENT_X509_CERT_URL"),
+    "universe_domain":             os.getenv("GOOGLE_UNIVERSE_DOMAIN", "googleapis.com"),
 }
 
 # =========================
@@ -316,31 +72,11 @@ except Exception as e:
     twilio_client = None
 
 # =========================
-# Google TTS client
-# =========================
-try:
-    tts_client = texttospeech.TextToSpeechClient.from_service_account_info(
-        google_service_account_info
-    )
-    print("✅ Google TTS connected", flush=True)
-except Exception as e:
-    print("🔥 GOOGLE TTS ERROR:", str(e), flush=True)
-    tts_client = None
-
-# =========================
 # Helpers
 # =========================
 INTEREST_KEYWORDS = [
-    "כן",
-    "מעוניין",
-    "תשלח",
-    "שלח לי",
-    "תשלחו",
-    "וואטסאפ",
-    "פרטים",
-    "אשמח",
-    "אשמח לקבל",
-    "דבר איתי",
+    "כן", "מעוניין", "תשלח", "שלח לי", "תשלחו",
+    "וואטסאפ", "פרטים", "אשמח", "אשמח לקבל", "דבר איתי",
 ]
 
 def is_interested(text: str) -> bool:
@@ -352,39 +88,31 @@ def is_interested(text: str) -> bool:
 def normalize_phone_for_whatsapp(phone: str) -> str:
     if not phone:
         return ""
-
     if phone.startswith("whatsapp:"):
         return phone
-
     digits = re.sub(r"[^\d+]", "", phone)
-
     if digits.startswith("0"):
         digits = "+972" + digits[1:]
     elif not digits.startswith("+"):
         digits = "+" + digits
-
     return f"whatsapp:{digits}"
 
 def append_lead_row(row: list):
     if sheet is None:
         print("⚠️ Sheet is not connected. Row not saved.", flush=True)
         return False
-
     sheet.append_row(row, value_input_option="USER_ENTERED")
     return True
 
 def send_whatsapp(to_phone: str, business_name: str = "", summary: str = ""):
     if twilio_client is None:
         raise RuntimeError("Twilio client not initialized")
-
     to_whatsapp = normalize_phone_for_whatsapp(to_phone)
-
     body = (
         f"היי{(' ' + business_name) if business_name else ''}, תודה על השיחה.\n"
         f"כמו שביקשת, הנה הפרטים להמשך.\n"
         f"{summary}"
     )
-
     msg = twilio_client.messages.create(
         from_=TWILIO_WHATSAPP_FROM,
         to=to_whatsapp,
@@ -396,6 +124,22 @@ def is_authorized(req) -> bool:
     auth_header = req.headers.get("Authorization", "")
     expected = f"Bearer {VAPI_WEBHOOK_SECRET}"
     return auth_header == expected
+
+def azure_tts(text: str, voice: str = "he-IL-AvriNeural", output_format: str = "raw-16khz-16bit-mono-pcm") -> bytes:
+    url = f"https://{AZURE_TTS_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
+    headers = {
+        "Ocp-Apim-Subscription-Key": AZURE_TTS_KEY,
+        "Content-Type": "application/ssml+xml",
+        "X-Microsoft-OutputFormat": output_format,
+        "User-Agent": "vapi-tts",
+    }
+    ssml = f"""<speak version='1.0' xml:lang='he-IL'>
+    <voice name='{voice}'>{text}</voice>
+</speak>"""
+    res = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=8)
+    if res.status_code != 200:
+        raise RuntimeError(f"Azure TTS error {res.status_code}: {res.text}")
+    return res.content
 
 # =========================
 # Health
@@ -409,40 +153,24 @@ def healthz():
     return {"ok": True}, 200
 
 # =========================
-# Manual Google TTS test - browser
+# Azure TTS test - browser
 # =========================
 @app.get("/test-tts")
 def test_tts():
-    if tts_client is None:
-        return {"ok": False, "error": "TTS not initialized"}, 500
-
+    if not AZURE_TTS_KEY:
+        return {"ok": False, "error": "AZURE_TTS_KEY not set"}, 500
     try:
-        synthesis_input = texttospeech.SynthesisInput(
-            text="שלום, מדבר ניב. זה טסט למערכת."
+        audio = azure_tts(
+            text="שלום, מדבר ניב. זה טסט למערכת.",
+            voice="he-IL-AvriNeural",
+            output_format="audio-16khz-32kbitrate-mono-mp3",
         )
-
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="he-IL",
-            name="he-IL-Wavenet-A",
-        )
-
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3,
-        )
-
-        response = tts_client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config,
-        )
-
         return send_file(
-            io.BytesIO(response.audio_content),
+            io.BytesIO(audio),
             mimetype="audio/mpeg",
             as_attachment=False,
             download_name="speech.mp3",
         )
-
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
 
@@ -451,61 +179,32 @@ def test_tts():
 # =========================
 @app.post("/vapi-tts")
 def vapi_tts():
-    if tts_client is None:
-        return {"ok": False, "error": "Google TTS not connected"}, 500
+    if not AZURE_TTS_KEY:
+        return Response(b"", mimetype="application/octet-stream")
 
     data = request.get_json(silent=True) or {}
     print("🔥 VAPI TTS REQUEST:", data, flush=True)
 
-    message = data.get("message", {})
-
-    if message.get("type") != "voice-request":
-        return {"ok": False, "error": "Invalid message type"}, 400
-
-    text = message.get("text", "")
-    sample_rate = int(message.get("sampleRate", 24000))
+    message = data.get("message", {}) or {}
+    text = message.get("text") or data.get("text") or ""
 
     if not text:
-        return {"ok": False, "error": "Missing text"}, 400
+        return Response(b"", mimetype="application/octet-stream")
 
-    voice_id = (
+    text = text[:300]
+
+    voice = (
         data.get("voiceId")
         or message.get("voiceId")
-        or "he-IL-Wavenet-A"
+        or "he-IL-AvriNeural"
     )
 
     try:
-        synthesis_input = texttospeech.SynthesisInput(text=text)
-
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="he-IL",
-            name=voice_id,
-        )
-
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=sample_rate,
-        )
-
-        response = tts_client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config,
-        )
-
-        audio = response.audio_content
-
-        # Vapi requires raw PCM. Google LINEAR16 may include WAV header.
-        if audio[:4] == b"RIFF":
-            data_index = audio.find(b"data")
-            if data_index != -1:
-                audio = audio[data_index + 8:]
-
+        audio = azure_tts(text=text, voice=voice, output_format="raw-16khz-16bit-mono-pcm")
         return Response(audio, mimetype="application/octet-stream")
-
     except Exception as e:
-        print("🔥 VAPI TTS ERROR:", str(e), flush=True)
-        return {"ok": False, "error": str(e)}, 500
+        print("🔥 AZURE TTS ERROR:", str(e), flush=True)
+        return Response(b"", mimetype="application/octet-stream")
 
 # =========================
 # Webhook from Vapi
@@ -525,26 +224,20 @@ def vapi_webhook():
     if msg_type != "end-of-call-report":
         return ("", 204)
 
-    call = message.get("call", {}) or {}
-    artifact = message.get("artifact", {}) or {}
-
-    call_id = call.get("id", "")
+    call         = message.get("call", {}) or {}
+    artifact     = message.get("artifact", {}) or {}
+    call_id      = call.get("id", "")
     phone_number = (
         call.get("customer", {}).get("number")
         or call.get("phoneNumber")
         or ""
     )
     business_name = call.get("customer", {}).get("name", "") or ""
-    ended_reason = message.get("endedReason", "")
-
-    transcript = (
-        artifact.get("transcript")
-        or call.get("transcript")
-        or ""
-    )
+    ended_reason  = message.get("endedReason", "")
+    transcript    = artifact.get("transcript") or call.get("transcript") or ""
 
     interested = is_interested(transcript)
-    answered = ended_reason not in [
+    answered   = ended_reason not in [
         "customer-did-not-answer",
         "assistant-not-available",
         "assistant-request-returned-no-assistant",
@@ -557,11 +250,11 @@ def vapi_webhook():
     )
 
     whatsapp_sent = "no"
-    whatsapp_sid = ""
+    whatsapp_sid  = ""
 
     if interested and phone_number:
         try:
-            whatsapp_sid = send_whatsapp(
+            whatsapp_sid  = send_whatsapp(
                 to_phone=phone_number,
                 business_name=business_name,
                 summary="נשמח להמשך שיחה ותיאום.",
@@ -586,11 +279,10 @@ def vapi_webhook():
     ]
 
     append_lead_row(row)
-
     return ("", 204)
 
 # =========================
-# Stats + Dashboard
+# Stats
 # =========================
 @app.get("/stats")
 def stats():
@@ -598,118 +290,81 @@ def stats():
         return jsonify({"ok": False, "error": "Google Sheets not connected"}), 500
 
     rows = sheet.get_all_records()
-
-    total_calls = len(rows)
-    answered_calls = sum(
-        1 for r in rows if str(r.get("answered", "")).lower() == "yes"
-    )
-    interested_calls = sum(
-        1 for r in rows if str(r.get("interested", "")).lower() == "yes"
-    )
-
-    interest_rate_from_total = (
-        round((interested_calls / total_calls) * 100, 2) if total_calls else 0
-    )
-    interest_rate_from_answered = (
-        round((interested_calls / answered_calls) * 100, 2)
-        if answered_calls
-        else 0
-    )
+    total_calls     = len(rows)
+    answered_calls  = sum(1 for r in rows if str(r.get("answered", "")).lower() == "yes")
+    interested_calls = sum(1 for r in rows if str(r.get("interested", "")).lower() == "yes")
 
     return jsonify({
-        "total_calls": total_calls,
-        "answered_calls": answered_calls,
-        "interested_calls": interested_calls,
-        "interest_rate_from_total_pct": interest_rate_from_total,
-        "interest_rate_from_answered_pct": interest_rate_from_answered,
+        "total_calls":                    total_calls,
+        "answered_calls":                 answered_calls,
+        "interested_calls":               interested_calls,
+        "interest_rate_from_total_pct":   round((interested_calls / total_calls) * 100, 2) if total_calls else 0,
+        "interest_rate_from_answered_pct": round((interested_calls / answered_calls) * 100, 2) if answered_calls else 0,
     })
 
+# =========================
+# Dashboard
+# =========================
 @app.get("/dashboard")
 def dashboard():
     if sheet is None:
-        return Response(
-            "<h1>Google Sheets not connected</h1>",
-            mimetype="text/html; charset=utf-8",
-            status=500,
-        )
+        return Response("<h1>Google Sheets not connected</h1>", mimetype="text/html; charset=utf-8", status=500)
 
     rows = sheet.get_all_records()
+    total        = len(rows)
+    answered     = sum(1 for r in rows if str(r.get("answered", "")).lower() == "yes")
+    interested   = sum(1 for r in rows if str(r.get("interested", "")).lower() == "yes")
+    whatsapp_sent = sum(1 for r in rows if str(r.get("whatsapp_sent", "")).lower().startswith("yes"))
 
-    total = len(rows)
-    answered = sum(1 for r in rows if str(r.get("answered", "")).lower() == "yes")
-    interested = sum(1 for r in rows if str(r.get("interested", "")).lower() == "yes")
-    whatsapp_sent = sum(
-        1 for r in rows if str(r.get("whatsapp_sent", "")).lower().startswith("yes")
-    )
-
-    conversion_total = round((interested / total) * 100, 2) if total else 0
+    conversion_total    = round((interested / total) * 100, 2) if total else 0
     conversion_answered = round((interested / answered) * 100, 2) if answered else 0
 
     recent_rows = list(reversed(rows[-20:])) if rows else []
 
     table_rows = ""
     for r in recent_rows:
-        interested_badge = (
-            "🟢 כן" if str(r.get("interested", "")).lower() == "yes" else "🔴 לא"
-        )
-        answered_badge = (
-            "🟢 כן" if str(r.get("answered", "")).lower() == "yes" else "🔴 לא"
-        )
-        wa_badge = (
-            "🟢 נשלח"
-            if str(r.get("whatsapp_sent", "")).lower().startswith("yes")
-            else "⚪ לא"
-        )
-
+        interested_badge = "🟢 כן" if str(r.get("interested", "")).lower() == "yes" else "🔴 לא"
+        answered_badge   = "🟢 כן" if str(r.get("answered", "")).lower() == "yes" else "🔴 לא"
+        wa_badge         = "🟢 נשלח" if str(r.get("whatsapp_sent", "")).lower().startswith("yes") else "⚪ לא"
         table_rows += f"""
         <tr>
-            <td>{r.get("timestamp", "")}</td>
-            <td>{r.get("business_name", "")}</td>
-            <td>{r.get("phone_number", "")}</td>
+            <td>{r.get("timestamp","")}</td>
+            <td>{r.get("business_name","")}</td>
+            <td>{r.get("phone_number","")}</td>
             <td>{answered_badge}</td>
             <td>{interested_badge}</td>
             <td>{wa_badge}</td>
-            <td>{r.get("ended_reason", "")}</td>
-            <td style="max-width:420px; white-space:normal;">{r.get("summary", "")}</td>
+            <td>{r.get("ended_reason","")}</td>
+            <td style="max-width:420px;white-space:normal;">{r.get("summary","")}</td>
+        </tr>"""
+
+    html = f"""<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="utf-8">
+    <title>Lead Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body style="font-family:Arial;padding:24px;">
+    <h1>דשבורד לידים</h1>
+    <p>סטטוס שיחות, התעניינות ושליחת וואטסאפ</p>
+    <p><b>סה״כ שיחות:</b> {total}</p>
+    <p><b>שיחות שנענו:</b> {answered}</p>
+    <p><b>מתעניינים:</b> {interested}</p>
+    <p><b>וואטסאפ נשלח:</b> {whatsapp_sent}</p>
+    <p><b>המרה מכלל השיחות:</b> {conversion_total}%</p>
+    <p><b>המרה מתוך מי שענה:</b> {conversion_answered}%</p>
+    <h2>20 הלידים האחרונים</h2>
+    <table border="1" cellpadding="6" cellspacing="0">
+        <tr>
+            <th>זמן</th><th>עסק</th><th>טלפון</th>
+            <th>ענה</th><th>התעניין</th><th>וואטסאפ</th>
+            <th>סיבת סיום</th><th>סיכום</th>
         </tr>
-        """
-
-    html = f"""
-    <!doctype html>
-    <html lang="he" dir="rtl">
-    <head>
-        <meta charset="utf-8">
-        <title>Lead Dashboard</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-    </head>
-    <body style="font-family: Arial; padding: 24px;">
-        <h1>דשבורד לידים</h1>
-        <p>סטטוס שיחות, התעניינות ושליחת וואטסאפ</p>
-
-        <p><b>סה״כ שיחות:</b> {total}</p>
-        <p><b>שיחות שנענו:</b> {answered}</p>
-        <p><b>מתעניינים:</b> {interested}</p>
-        <p><b>וואטסאפ נשלח:</b> {whatsapp_sent}</p>
-        <p><b>המרה מכלל השיחות:</b> {conversion_total}%</p>
-        <p><b>המרה מתוך מי שענה:</b> {conversion_answered}%</p>
-
-        <h2>20 הלידים האחרונים</h2>
-        <table border="1" cellpadding="6" cellspacing="0">
-            <tr>
-                <th>זמן</th>
-                <th>עסק</th>
-                <th>טלפון</th>
-                <th>ענה</th>
-                <th>התעניין</th>
-                <th>וואטסאפ</th>
-                <th>סיבת סיום</th>
-                <th>סיכום</th>
-            </tr>
-            {table_rows if table_rows else '<tr><td colspan="8">אין נתונים עדיין</td></tr>'}
-        </table>
-    </body>
-    </html>
-    """
+        {table_rows if table_rows else '<tr><td colspan="8">אין נתונים עדיין</td></tr>'}
+    </table>
+</body>
+</html>"""
 
     return Response(html, mimetype="text/html; charset=utf-8")
 
