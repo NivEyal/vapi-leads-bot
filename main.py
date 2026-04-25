@@ -3,7 +3,10 @@ import json
 import asyncio
 import websockets
 import base64
-import audioop  # ספרייה מובנית בפייתון להמרת אודיו
+try:
+    import audioop
+except ImportError:
+    from audioop_lts import audioop
 from fastapi import FastAPI, WebSocket, Request, Response
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 from twilio.rest import Client
