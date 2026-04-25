@@ -329,42 +329,55 @@ def voice():
 
     greeting = (
         "שלום, מדבר עוזר דיגיטלי שעוזר לעסקים לא לפספס לקוחות. "
-        "תרצה שאשלח לך פרטים בוואטסאפ?"
+        "תרצה שאשלח לך פרטים בוואטסאפ? תגיד כן."
     )
 
     try:
         audio_url = grok_tts(greeting)
         print("🔊 GREETING AUDIO:", audio_url, flush=True)
-
-        gather = r.gather(
-            input="speech",
-            action="/gather",
-            method="POST",
-            language="he-IL",
-            speech_timeout="auto",
-            timeout=5,
-        )
-        gather.play(audio_url)
-
+        r.play(audio_url)
     except Exception as e:
         print("🔥 GREETING TTS ERROR:", str(e), flush=True)
+        r.say("שלום, תרצה שאשלח לך פרטים בוואטסאפ? תגיד כן.", language="he-IL")
 
-        gather = r.gather(
-            input="speech",
-            action="/gather",
-            method="POST",
-            language="he-IL",
-            speech_timeout="auto",
-            timeout=5,
-        )
-        gather.say("שלום, תרצה שאשלח לך פרטים בוואטסאפ?", language="he-IL")
+    r.pause(length=1)
+
+    gather = r.gather(
+        input="speech",
+        action="/gather",
+        method="POST",
+        language="he-IL",
+        speech_timeout="auto",
+        timeout=8,
+        hints="כן,בטח,ברור,סבבה,שלח,תשלח,וואטסאפ,yes,yeah,ok,okay,sure",
+    )
+
+    gather.say("אני מקשיב. תגיד כן לשליחת פרטים.", language="he-IL")
+
+    r.redirect("/voice-timeout")
+
+    return Response(str(r), mimetype="text/xml")
+
+@app.post("/voice-timeout")
+def voice_timeout():
+    r = VoiceResponse()
+
+    gather = r.gather(
+        input="speech",
+        action="/gather",
+        method="POST",
+        language="he-IL",
+        speech_timeout="auto",
+        timeout=10,
+        hints="כן,בטח,ברור,סבבה,שלח,תשלח,וואטסאפ,yes,yeah,ok,okay,sure",
+    )
+
+    gather.say("לא שמעתי תשובה. תגיד כן אם תרצה שאשלח לך פרטים בוואטסאפ.", language="he-IL")
 
     r.say("לא התקבלה תשובה. תודה ולהתראות.", language="he-IL")
     r.hangup()
 
     return Response(str(r), mimetype="text/xml")
-
-
 @app.post("/gather")
 def gather():
     caller = request.form.get("From", "")
