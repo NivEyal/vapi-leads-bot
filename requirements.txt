@@ -16,3 +16,4 @@ websockets
 asyncio
 python-multipart
 audioop
+audioop-lts
