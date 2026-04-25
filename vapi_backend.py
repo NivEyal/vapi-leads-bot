@@ -23,7 +23,7 @@ TWILIO_CALLER_ID = os.getenv("TWILIO_CALLER_ID")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
 
 XAI_API_KEY = os.getenv("XAI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
