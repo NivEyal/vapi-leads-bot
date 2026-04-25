@@ -108,16 +108,17 @@ async def media_stream(websocket: WebSocket):
                     "modalities": ["audio", "text"],
                     "instructions": (
                         "אתה עוזר דיגיטלי עסקי בשם גרוק. תדבר בעברית בלבד. "
-                        "אם הלקוח אומר כן, אוקיי, תשלח, או yes - הפעל את send_whatsapp. "
+                        "תפקידך להציע את השירות של העוזר הדיגיטלי ב-10 שקלים ליום. "
+                        "אם הלקוח אומר כן, אוקיי, תשלח, או yes - הפעל את הכלי send_whatsapp. "
                         "תשובות קצרות מאוד: משפט אחד."
                     ),
                     "voice": os.getenv("GROK_VOICE", "leo"),
                     "input_audio_format": "g711_ulaw",
-                    "output_audio_format": "pcm16", # עוברים ל-PCM כדי לבצע Resampling
+                    "output_audio_format": "pcm16", # מעבירים PCM16 לתיקון המהירות
                     "turn_detection": {
                         "type": "server_vad", 
                         "threshold": 0.4,
-                        "silence_duration_ms": 1000 # מחכה שנייה לפני שמחליט שסיימת (עוזר לזיהוי "כן")
+                        "silence_duration_ms": 1000 # מחכה שנייה של שקט כדי לזהות "כן" טוב יותר
                     },
                     "tools": [{
                         "type": "function",
@@ -139,7 +140,7 @@ async def media_stream(websocket: WebSocket):
                         payload = response.get("delta") or response.get("audio")
                         if payload and stream_sid and audioop:
                             pcm_data = base64.b64decode(payload)
-                            # המרה מ-24k ל-8k (מונע קול איטי)
+                            # --- תיקון המהירות (Resampling מ-24k ל-8k) ---
                             resampled_data, resample_state = audioop.ratecv(pcm_data, 2, 1, 24000, 8000, resample_state)
                             mu_law_data = audioop.lin2ulaw(resampled_data, 2)
                             encoded_payload = base64.b64encode(mu_law_data).decode('utf-8')
@@ -159,14 +160,15 @@ async def media_stream(websocket: WebSocket):
                     if data.get('event') == 'start':
                         stream_sid = data['start']['streamSid']
                         phone_number = data['start']['customParameters'].get('caller')
-                        print(f"📞 Incoming call from: {phone_number}", flush=True)
                         
-                        # המשפט המקורי שלך
+                        # --- משפט הפתיחה המדויק שלך ---
+                        greeting_text = "שלום, אני עוזר דיגיטלי ב-10 שקלים ליום. תרצה שאשלח לך פרטים בוואטסאפ?"
+                        
                         greeting = {
                             "type": "conversation.item.create",
                             "item": {
                                 "type": "message", "role": "user",
-                                "content": [{"type": "input_text", "text": "תפתח בדיוק במשפט הזה: שלום, אני עוזר דיגיטלי ב-10 שקלים ליום. תרצה שאשלח לך פרטים בוואטסאפ?"}]
+                                "content": [{"type": "input_text", "text": f"תפתח בדיוק במשפט הזה: {greeting_text}"}]
                             }
                         }
                         await xai_ws.send(json.dumps(greeting))
