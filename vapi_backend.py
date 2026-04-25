@@ -508,7 +508,24 @@ def dashboard():
             status=500,
         )
 
-    rows = sheet.get_all_records()
+    EXPECTED_HEADERS = [
+    "timestamp",
+    "call_sid",
+    "caller",
+    "user_text",
+    "interested",
+    "sentiment",
+    "lead_quality",
+    "next_action",
+    "summary",
+    "whatsapp_sent",
+    "whatsapp_sid",
+    "stt_error",
+    "openai_error",
+    "tts_error",
+]
+
+rows = sheet.get_all_records(expected_headers=EXPECTED_HEADERS)
 
     total = len(rows)
     interested = sum(1 for r in rows if str(r.get("interested", "")).lower() == "yes")
