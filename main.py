@@ -5,24 +5,19 @@ import websockets
 from fastapi import FastAPI, WebSocket, Request, Response
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 from twilio.rest import Client
-import gspread
-from google.oauth2.service_account import Credentials
 
 app = FastAPI()
 
 # --- הגדרות סביבה ---
-BOT_LANGUAGE = os.getenv("BOT_LANGUAGE", "he").strip()
 BASE_URL = os.getenv("PUBLIC_BASE_URL", "").replace("https://", "").replace("http://", "").rstrip("/")
+TWILIO_CLIENT = Client(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
 
-# --- פונקציות עזר ---
 def normalize_whatsapp_number(phone):
     if not phone: return ""
     phone = phone.replace(" ", "").replace("-", "")
     if phone.startswith("0"): phone = "+972" + phone[1:]
     elif phone.startswith("972"): phone = "+" + phone
     return f"whatsapp:{phone}"
-
-TWILIO_CLIENT = Client(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
 
 def send_whatsapp_logic(to_number):
     if not to_number: return False
@@ -82,14 +77,12 @@ async def media_stream(websocket: WebSocket):
                 "type": "session.update",
                 "session": {
                     "modalities": ["audio", "text"],
-                    "instructions": "אתה עוזר עסקי. דבר בעברית קצרה מאוד. אם הלקוח רוצה פרטים, שלח וואטסאפ.",
+                    "instructions": "אתה עוזר עסקי בעברית. דבר קצר. אם הלקוח מאשר, שלח וואטסאפ.",
                     "voice": os.getenv("GROK_VOICE", "leo"),
-                    "input_audio_format": "g711_ulaw",
-                    "output_audio_format": "g711_ulaw",
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.5
-                    },
+                    # תיקון פורמט לפי ה-Docs של xAI
+                    "input_audio_format": {"type": "audio/pcmu"},
+                    "output_audio_format": {"type": "audio/pcmu"},
+                    "turn_detection": {"type": "server_vad", "threshold": 0.5},
                     "tools": [{
                         "type": "function",
                         "name": "send_whatsapp",
@@ -109,10 +102,10 @@ async def media_stream(websocket: WebSocket):
                     if event_type in ["response.audio.delta", "response.output_audio.delta"]:
                         payload = response.get("delta") or response.get("audio")
                         if payload and stream_sid:
-                            # לוג לדיבוג פורמט האודיו
-                            print(f"AUDIO DELTA LEN: {len(payload)} | START: {payload[:20]}", flush=True)
+                            # לוג לדיבוג - מוודא שזה Base64
+                            print(f"AUDIO DELTA: {len(payload)} | {payload[:20]}", flush=True)
                             
-                            # תיקון: שליחת ה-payload כמו שהוא ללא המרה ל-str()
+                            # תיקון: שליחת ה-payload המקורי ללא str()
                             await websocket.send_json({
                                 "event": "media",
                                 "streamSid": stream_sid,
@@ -134,30 +127,28 @@ async def media_stream(websocket: WebSocket):
                 nonlocal stream_sid, phone_number
                 async for message in websocket.iter_text():
                     data = json.loads(message)
-                    event = data.get('event')
-                    
-                    if event == 'start':
+                    if data.get('event') == 'start':
                         stream_sid = data['start']['streamSid']
                         phone_number = data['start']['customParameters'].get('caller')
-                        print(f"📞 Started: {phone_number}", flush=True)
+                        print(f"📞 Call Started: {phone_number}", flush=True)
                         
                         greeting = {
                             "type": "conversation.item.create",
                             "item": {
                                 "type": "message", "role": "user",
-                                "content": [{"type": "input_text", "text": "תגיד בדיוק: שלום, לשלוח לך פרטים בוואטסאפ?"}]
+                                "content": [{"type": "input_text", "text": "תפתח במשפט קצר בעברית: שלום, לשלוח לך פרטים בוואטסאפ?"}]
                             }
                         }
                         await xai_ws.send(json.dumps(greeting))
                         await xai_ws.send(json.dumps({"type": "response.create"}))
                     
-                    elif event == 'media':
+                    elif data.get('event') == 'media':
                         await xai_ws.send(json.dumps({
                             "type": "input_audio_buffer.append", 
                             "audio": data['media']['payload']
                         }))
                     
-                    elif event in ['stop', 'close']:
+                    elif data.get('event') in ['stop', 'close']:
                         break
 
             await asyncio.gather(xai_to_twilio(), twilio_to_xai())
