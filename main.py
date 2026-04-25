@@ -116,10 +116,18 @@ async def media_stream(websocket: WebSocket):
     headers = {"Authorization": f"Bearer {os.getenv('XAI_API_KEY')}"}
 
     try:
-        async with websockets.connect(xai_url, extra_headers=headers) as xai_ws:
+        async with websockets.connect(
+            xai_url,
+            additional_headers=headers,
+            ping_interval=20,
+            ping_timeout=20,
+        ) as xai_ws:
+            print("✅ Connected to xAI realtime", flush=True)
+
             stream_sid = None
             phone_number = None
             whatsapp_sent_once = False
+
 
             # הגדרת סשן מול Grok
             session_update = {
