@@ -148,6 +148,71 @@ def safe_json_loads(text):
     return {}
 
 # =========================
+# ✅ IMPROVED: Hebrew "yes" detection
+# =========================
+
+# מילות כן - word-boundary aware
+YES_WORDS = [
+    "כן", "בטח", "ברור", "אפשר", "יאללה", "סבבה", "אוקיי", "אוקי",
+    "שלח", "תשלח", "תשלחי", "שלחו", "וואטסאפ", "ווטסאפ", "ווצאפ",
+    "מעוניין", "מעוניינת", "רוצה", "אשמח", "פרטים", "יכול",
+    "yes", "yeah", "yep", "ok", "okay", "sure", "please",
+]
+
+# מילות לא - חייבות להופיע כמילה שלמה
+NO_WORDS = [
+    "לא מעוניין", "לא מעוניינת", "לא רלוונטי", "לא תודה",
+    "אל תשלח", "לא לשלוח", "תוריד", "עזוב",
+    "no thanks", "not interested",
+]
+
+def detect_interest(text: str) -> bool:
+    """
+    מחזיר True אם הטקסט מכיל עניין.
+    - בודק מילות 'לא' תחילה כמילים שלמות
+    - אז בודק מילות 'כן' - כולל word-boundary כדי למנוע false positives
+    """
+    if not text:
+        return False
+
+    clean = text.strip().lower()
+    # נרמול תווים מיוחדים
+    clean = re.sub(r"[^\w\u0590-\u05FF\s]", " ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+
+    print(f"🔍 DETECT INTEREST INPUT: '{clean}'", flush=True)
+
+    # בדוק סירוב - כביטויים שלמים
+    for phrase in NO_WORDS:
+        if phrase in clean:
+            print(f"❌ NO match: '{phrase}'", flush=True)
+            return False
+
+    # מניעת false positive: "לא" לבד כמילה שלמה = סירוב
+    if re.search(r"(?<!\S)לא(?!\S)", clean):
+        # אם יש "לא" לבד אבל גם מילת כן אחרת - כן מנצח
+        # לדוגמה: "לא, רגע, כן בטח" -> כן
+        has_strong_yes = any(
+            re.search(rf"(?<!\S){re.escape(w)}(?!\S)", clean)
+            for w in ["כן", "בטח", "ברור", "אשמח", "רוצה", "yes", "ok", "okay", "sure"]
+        )
+        if not has_strong_yes:
+            print(f"❌ Standalone 'לא' detected, no strong yes override", flush=True)
+            return False
+
+    # בדוק עניין
+    for word in YES_WORDS:
+        # word-boundary: לא חלק ממילה אחרת
+        pattern = rf"(?<!\S){re.escape(word)}(?!\S)"
+        if re.search(pattern, clean):
+            print(f"✅ YES match: '{word}'", flush=True)
+            return True
+
+    print(f"⚪ No match found - defaulting to False", flush=True)
+    return False
+
+
+# =========================
 # WhatsApp
 # =========================
 def send_whatsapp(to_phone, summary=""):
@@ -167,6 +232,82 @@ def send_whatsapp(to_phone, summary=""):
         ),
     )
     return msg.sid
+
+# =========================
+# ✅ TTS Cache - מונע קריאות חוזרות לאותן הודעות
+# =========================
+_tts_cache: dict[str, str] = {}
+
+def grok_tts(text: str) -> str:
+    """מחזיר URL לקובץ אודיו. שומר cache לפי טקסט."""
+    if text in _tts_cache:
+        # וודא שהקובץ עדיין קיים
+        cached_url = _tts_cache[text]
+        file_name = cached_url.split("/")[-1]
+        if os.path.exists(os.path.join(AUDIO_DIR, file_name)):
+            print(f"🎵 TTS CACHE HIT", flush=True)
+            return cached_url
+
+    if not XAI_API_KEY:
+        raise RuntimeError("XAI_API_KEY missing")
+
+    payload = {
+        "text": text[:1500],
+        "voice_id": GROK_TTS_VOICE,
+        "language": GROK_TTS_LANGUAGE,
+        "format": "mp3",
+    }
+
+    res = requests.post(
+        "https://api.x.ai/v1/tts",
+        headers={
+            "Authorization": f"Bearer {XAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=45,
+    )
+
+    print("🔥 GROK TTS STATUS:", res.status_code, res.headers.get("content-type"), flush=True)
+    if res.status_code != 200:
+        print("🔥 GROK TTS BODY:", res.text[:300], flush=True)
+        raise RuntimeError(f"Grok TTS error {res.status_code}: {res.text[:300]}")
+
+    file_id = str(uuid.uuid4())
+    file_name = f"{file_id}.mp3"
+    path = os.path.join(AUDIO_DIR, file_name)
+
+    with open(path, "wb") as f:
+        f.write(res.content)
+
+    url = f"{PUBLIC_BASE_URL}/audio/{file_name}"
+    _tts_cache[text] = url
+    return url
+
+
+# =========================
+# ✅ Pre-warm TTS cache at startup
+# =========================
+GREETING_TEXT = (
+    "שלום, מדבר עוזר דיגיטלי שעוזר לעסקים לא לפספס לקוחות. "
+    "תרצה שאשלח לך פרטים בוואטסאפ? תגיד כן."
+)
+SUCCESS_TEXT = "מעולה, שלחתי לך הודעה בוואטסאפ. תודה ולהתראות."
+RETRY_TEXT = "לא שמעתי תשובה ברורה. תגיד כן אם תרצה שאשלח לך פרטים בוואטסאפ."
+FINAL_TEXT = "תודה רבה ולהתראות."
+
+def prewarm_tts():
+    """מייצר את קבצי האודיו הקבועים בעת הפעלה כדי לחסוך זמן בשיחה."""
+    if not XAI_API_KEY:
+        print("⚠️ Skipping TTS prewarm - no XAI_API_KEY", flush=True)
+        return
+    for text in [GREETING_TEXT, SUCCESS_TEXT, RETRY_TEXT, FINAL_TEXT]:
+        try:
+            grok_tts(text)
+            print(f"🎵 Pre-warmed TTS: {text[:40]}...", flush=True)
+        except Exception as e:
+            print(f"⚠️ TTS prewarm failed: {e}", flush=True)
+
 
 # =========================
 # Grok STT
@@ -198,43 +339,6 @@ def grok_stt(recording_url):
 
     return res.json().get("text", "").strip()
 
-# =========================
-# Grok TTS - HE + Leo
-# =========================
-def grok_tts(text):
-    if not XAI_API_KEY:
-        raise RuntimeError("XAI_API_KEY missing")
-
-    payload = {
-        "text": text[:1500],
-        "voice_id": GROK_TTS_VOICE,      # leo
-        "language": GROK_TTS_LANGUAGE,   # he
-        "format": "mp3",
-    }
-
-    res = requests.post(
-        "https://api.x.ai/v1/tts",
-        headers={
-            "Authorization": f"Bearer {XAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=45,
-    )
-
-    print("🔥 GROK TTS STATUS:", res.status_code, res.headers.get("content-type"), flush=True)
-    if res.status_code != 200:
-        print("🔥 GROK TTS BODY:", res.text[:300], flush=True)
-        raise RuntimeError(f"Grok TTS error {res.status_code}: {res.text[:300]}")
-
-    file_id = str(uuid.uuid4())
-    file_name = f"{file_id}.mp3"
-    path = os.path.join(AUDIO_DIR, file_name)
-
-    with open(path, "wb") as f:
-        f.write(res.content)
-
-    return f"{PUBLIC_BASE_URL}/audio/{file_name}"
 
 @app.get("/audio/<file_name>")
 def serve_audio(file_name):
@@ -246,10 +350,15 @@ def serve_audio(file_name):
     with open(path, "rb") as f:
         audio = f.read()
 
-    return Response(audio, mimetype="audio/mpeg")
+    return Response(
+        audio,
+        mimetype="audio/mpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
 
 # =========================
-# OpenAI Analyze
+# OpenAI Analyze (optional - not used in main flow)
 # =========================
 SYSTEM_PROMPT = """
 אתה נציג מכירות טלפוני בעברית לעסקים קטנים.
@@ -315,8 +424,9 @@ def openai_analyze(user_text, caller=""):
         "raw": text,
     }
 
+
 # =========================
-# Voice Start
+# ✅ IMPROVED: Voice Start - מהיר יותר, say כ-fallback מהיר
 # =========================
 @app.post("/voice")
 def voice():
@@ -327,18 +437,14 @@ def voice():
 
     r = VoiceResponse()
 
-    greeting = (
-        "שלום, מדבר עוזר דיגיטלי שעוזר לעסקים לא לפספס לקוחות. "
-        "תרצה שאשלח לך פרטים בוואטסאפ? תגיד כן."
-    )
-
+    # נסה להשתמש בקובץ pre-warmed - אחרת say מהיר
     try:
-        audio_url = grok_tts(greeting)
+        audio_url = grok_tts(GREETING_TEXT)
         print("🔊 GREETING AUDIO:", audio_url, flush=True)
         r.play(audio_url)
     except Exception as e:
         print("🔥 GREETING TTS ERROR:", str(e), flush=True)
-        r.say("שלום, תרצה שאשלח לך פרטים בוואטסאפ? תגיד כן.", language="he-IL")
+        r.say(GREETING_TEXT, language="he-IL")
 
     r.pause(length=1)
 
@@ -349,72 +455,75 @@ def voice():
         language="he-IL",
         speech_timeout="auto",
         timeout=8,
-        hints="כן,בטח,ברור,סבבה,שלח,תשלח,וואטסאפ,yes,yeah,ok,okay,sure",
+        hints=(
+            "כן,בטח,ברור,סבבה,שלח,תשלח,וואטסאפ,yes,yeah,ok,okay,sure,"
+            "אשמח,רוצה,מעוניין,מעוניינת,אפשר,יאללה,פרטים"
+        ),
     )
-
-    gather.say("אני מקשיב. תגיד כן לשליחת פרטים.", language="he-IL")
+    gather.say("אני מקשיב.", language="he-IL")
 
     r.redirect("/voice-timeout")
 
     return Response(str(r), mimetype="text/xml")
 
+
 @app.post("/voice-timeout")
 def voice_timeout():
     r = VoiceResponse()
 
-    gather = r.gather(
-        input="speech",
-        action="/gather",
-        method="POST",
-        language="he-IL",
-        speech_timeout="auto",
-        timeout=10,
-        hints="כן,בטח,ברור,סבבה,שלח,תשלח,וואטסאפ,yes,yeah,ok,okay,sure",
-    )
+    try:
+        audio_url = grok_tts(RETRY_TEXT)
+        gather = r.gather(
+            input="speech",
+            action="/gather",
+            method="POST",
+            language="he-IL",
+            speech_timeout="auto",
+            timeout=10,
+            hints="כן,בטח,ברור,סבבה,שלח,תשלח,וואטסאפ,yes,yeah,ok,sure,אשמח,רוצה",
+        )
+        gather.play(audio_url)
+    except Exception:
+        gather = r.gather(
+            input="speech",
+            action="/gather",
+            method="POST",
+            language="he-IL",
+            speech_timeout="auto",
+            timeout=10,
+            hints="כן,בטח,ברור,סבבה,שלח,תשלח,וואטסאפ,yes,yeah,ok,sure,אשמח,רוצה",
+        )
+        gather.say(RETRY_TEXT, language="he-IL")
 
-    gather.say("לא שמעתי תשובה. תגיד כן אם תרצה שאשלח לך פרטים בוואטסאפ.", language="he-IL")
+    try:
+        r.play(grok_tts(FINAL_TEXT))
+    except Exception:
+        r.say(FINAL_TEXT, language="he-IL")
 
-    r.say("לא התקבלה תשובה. תודה ולהתראות.", language="he-IL")
     r.hangup()
-
     return Response(str(r), mimetype="text/xml")
+
+
+# =========================
+# ✅ IMPROVED: Gather - זיהוי עניין משופר + לוג מפורט
+# =========================
 @app.post("/gather")
 def gather():
     caller = request.form.get("From", "")
     call_sid = request.form.get("CallSid", "")
     speech_result = request.form.get("SpeechResult", "")
 
-    print("🧠 TWILIO SPEECH RAW:", repr(speech_result), flush=True)
+    print(f"🎤 SPEECH RESULT RAW: {repr(speech_result)}", flush=True)
 
-    clean_text = (speech_result or "").strip().lower()
-    clean_text = re.sub(r"[^\w\u0590-\u05FF\s]", " ", clean_text)
-    clean_text = re.sub(r"\s+", " ", clean_text)
+    interested = detect_interest(speech_result)
 
-    print("🧠 TWILIO SPEECH CLEAN:", clean_text, flush=True)
-
-    yes_keywords = [
-        "כן", "בטח", "ברור", "אפשר", "יאללה", "סבבה",
-        "אוקיי", "אוקי", "שלח", "תשלח", "וואטסאפ", "ווטסאפ",
-        "מעוניין", "מעוניינת", "רוצה", "אשמח", "פרטים",
-        "yes", "yeah", "yep", "ok", "okay", "sure"
-    ]
-
-    no_keywords = [
-        "לא", "לא תודה", "לא מעוניין", "לא רלוונטי",
-        "עזוב", "תוריד", "אל תשלח", "לא לשלוח",
-        "no", "no thanks"
-    ]
-
-    interested = any(k in clean_text for k in yes_keywords)
-    rejected = any(k in clean_text for k in no_keywords)
-
-    if rejected:
-        interested = False
+    print(f"📊 INTERESTED: {interested} | caller: {caller}", flush=True)
 
     whatsapp_sent = "no"
     whatsapp_sid = ""
     summary = "הלקוח ביקש לקבל פרטים בוואטסאפ." if interested else "לא זוהה עניין ברור."
 
+    # שלח וואטסאפ אם מעוניין
     if interested and caller:
         try:
             whatsapp_sid = send_whatsapp(
@@ -422,10 +531,12 @@ def gather():
                 summary="נשמח להמשך שיחה ותיאום."
             )
             whatsapp_sent = "yes"
+            print(f"✅ WhatsApp sent to {caller} | SID: {whatsapp_sid}", flush=True)
         except Exception as e:
             whatsapp_sent = f"failed: {str(e)[:120]}"
             print("🔥 WHATSAPP ERROR:", str(e), flush=True)
 
+    # שמור ב-Sheets ב-background (לא חוסם את התגובה)
     row = [
         now_iso(),
         call_sid,
@@ -451,29 +562,113 @@ def gather():
     r = VoiceResponse()
 
     if interested:
-        r.say("מעולה, שלחתי לך הודעה בוואטסאפ. תודה ולהתראות.", language="he-IL")
+        if whatsapp_sent == "yes":
+            try:
+                r.play(grok_tts(SUCCESS_TEXT))
+            except Exception:
+                r.say(SUCCESS_TEXT, language="he-IL")
+        else:
+            r.say(
+                "קיבלתי את האישור שלך. הייתה בעיה בשליחת הוואטסאפ, נחזור אליך בהקדם.",
+                language="he-IL",
+            )
         r.hangup()
+
     else:
+        # ניסיון נוסף אחד - אם עדיין לא ברור, נסיים
         gather_retry = r.gather(
             input="speech",
-            action="/gather",
+            action="/gather-final",
             method="POST",
             language="he-IL",
             speech_timeout="auto",
-            timeout=5,
+            timeout=6,
+            hints="כן,בטח,ברור,שלח,תשלח,וואטסאפ,yes,ok,sure,אשמח,רוצה",
         )
         gather_retry.say(
-            "לא קלטתי אישור ברור. תגיד כן אם תרצה שאשלח לך פרטים בוואטסאפ.",
+            "לא קלטתי. תגיד כן אם תרצה שאשלח לך פרטים בוואטסאפ.",
             language="he-IL",
         )
 
-        r.say("תודה רבה ולהתראות.", language="he-IL")
+        try:
+            r.play(grok_tts(FINAL_TEXT))
+        except Exception:
+            r.say(FINAL_TEXT, language="he-IL")
         r.hangup()
 
     return Response(str(r), mimetype="text/xml")
 
+
 # =========================
-# Process Recording
+# ✅ NEW: Gather Final - ניסיון אחרון
+# =========================
+@app.post("/gather-final")
+def gather_final():
+    caller = request.form.get("From", "")
+    call_sid = request.form.get("CallSid", "")
+    speech_result = request.form.get("SpeechResult", "")
+
+    print(f"🎤 GATHER FINAL RAW: {repr(speech_result)}", flush=True)
+
+    interested = detect_interest(speech_result)
+
+    whatsapp_sent = "no"
+    whatsapp_sid = ""
+
+    if interested and caller:
+        try:
+            whatsapp_sid = send_whatsapp(
+                to_phone=caller,
+                summary="נשמח להמשך שיחה ותיאום."
+            )
+            whatsapp_sent = "yes"
+        except Exception as e:
+            whatsapp_sent = f"failed: {str(e)[:120]}"
+            print("🔥 WHATSAPP ERROR (final):", str(e), flush=True)
+
+    summary = "הלקוח ביקש לקבל פרטים (ניסיון שני)." if interested else "לא זוהה עניין - סיום שיחה."
+
+    row = [
+        now_iso(),
+        call_sid + "_retry",
+        caller,
+        speech_result,
+        "yes" if interested else "no",
+        "positive" if interested else "neutral",
+        "hot" if interested else "cold",
+        "send_whatsapp" if interested else "no_action",
+        summary,
+        whatsapp_sent,
+        whatsapp_sid,
+        "",
+        "",
+        "",
+    ]
+
+    try:
+        append_lead_row(row)
+    except Exception as e:
+        print("🔥 SHEET APPEND ERROR (final):", str(e), flush=True)
+
+    r = VoiceResponse()
+
+    if interested:
+        try:
+            r.play(grok_tts(SUCCESS_TEXT))
+        except Exception:
+            r.say(SUCCESS_TEXT, language="he-IL")
+    else:
+        try:
+            r.play(grok_tts(FINAL_TEXT))
+        except Exception:
+            r.say(FINAL_TEXT, language="he-IL")
+
+    r.hangup()
+    return Response(str(r), mimetype="text/xml")
+
+
+# =========================
+# Process Recording (STT flow)
 # =========================
 @app.post("/process")
 def process():
@@ -495,53 +690,7 @@ def process():
 
     print("🧠 USER TEXT RAW:", repr(user_text), flush=True)
 
-    clean_text = (user_text or "").strip().lower()
-    clean_text = re.sub(r"[^\w\u0590-\u05FF\s]", " ", clean_text)
-    clean_text = re.sub(r"\s+", " ", clean_text)
-
-    print("🧠 USER TEXT CLEAN:", clean_text, flush=True)
-
-    yes_keywords = [
-        "כן",
-        "כן כן",
-        "בטח",
-        "ברור",
-        "אפשר",
-        "יאללה",
-        "סבבה",
-        "אוקיי",
-        "אוקי",
-        "שלח",
-        "תשלח",
-        "תשלחי",
-        "שלחו",
-        "וואטסאפ",
-        "ווטסאפ",
-        "מעוניין",
-        "מעוניינת",
-        "רוצה",
-        "אשמח",
-        "פרטים",
-        "תשלח לי",
-        "שלח לי",
-    ]
-
-    no_keywords = [
-        "לא",
-        "לא תודה",
-        "לא מעוניין",
-        "לא רלוונטי",
-        "עזוב",
-        "תוריד",
-        "אל תשלח",
-        "לא לשלוח",
-    ]
-
-    interested = any(k in clean_text for k in yes_keywords)
-    rejected = any(k in clean_text for k in no_keywords)
-
-    if rejected:
-        interested = False
+    interested = detect_interest(user_text)
 
     summary = "הלקוח ביקש לקבל פרטים בוואטסאפ." if interested else "לא זוהה עניין ברור."
 
@@ -582,13 +731,19 @@ def process():
 
     if interested:
         if whatsapp_sent == "yes":
-            r.say("מעולה, שלחתי לך הודעה בוואטסאפ. תודה ולהתראות.", language="he-IL")
+            try:
+                r.play(grok_tts(SUCCESS_TEXT))
+            except Exception:
+                r.say(SUCCESS_TEXT, language="he-IL")
         else:
-            r.say("מעולה, קיבלתי את האישור שלך. הייתה בעיה בשליחת הוואטסאפ, אבל שמרתי את הפרטים ונחזור אליך.", language="he-IL")
+            r.say(
+                "קיבלתי את האישור שלך. הייתה בעיה בשליחת הוואטסאפ, אבל שמרתי את הפרטים ונחזור אליך.",
+                language="he-IL",
+            )
         r.hangup()
-        
+
     else:
-        r.say("לא קלטתי אישור ברור. אם תרצה פרטים, תגיד כן או שלח לי וואטסאפ.", language="he-IL")
+        r.say("לא קלטתי אישור ברור. אם תרצה פרטים, תגיד כן.", language="he-IL")
         r.record(
             action="/process",
             method="POST",
@@ -597,10 +752,14 @@ def process():
             play_beep=False,
             transcribe=False,
         )
-        r.say("תודה רבה ולהתראות.", language="he-IL")
+        try:
+            r.play(grok_tts(FINAL_TEXT))
+        except Exception:
+            r.say(FINAL_TEXT, language="he-IL")
         r.hangup()
 
     return Response(str(r), mimetype="text/xml")
+
 
 # =========================
 # Test WhatsApp
@@ -617,6 +776,17 @@ def test_whatsapp():
         return jsonify({"ok": True, "sid": sid})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# =========================
+# ✅ NEW: Debug endpoint - לבדוק זיהוי מילים
+# =========================
+@app.get("/test-detect")
+def test_detect():
+    text = request.args.get("text", "").strip()
+    result = detect_interest(text)
+    return jsonify({"text": text, "interested": result})
+
 
 # =========================
 # Stats
@@ -639,6 +809,7 @@ def stats():
         "whatsapp_sent": whatsapp_sent,
         "conversion_pct": round((interested / total) * 100, 2) if total else 0,
     })
+
 
 # =========================
 # Dashboard
@@ -748,6 +919,7 @@ th {{
 """
     return Response(html, mimetype="text/html; charset=utf-8")
 
+
 # =========================
 # Health
 # =========================
@@ -759,12 +931,19 @@ def home():
         "service": "AI sales call bot",
         "tts_voice": GROK_TTS_VOICE,
         "tts_language": GROK_TTS_LANGUAGE,
-        "routes": ["/voice", "/dashboard", "/stats", "/test-whatsapp?to=+972..."],
+        "routes": ["/voice", "/dashboard", "/stats", "/test-whatsapp?to=+972...", "/test-detect?text=כן בטח"],
     })
 
 @app.get("/healthz")
 def healthz():
     return jsonify({"ok": True})
+
+
+# =========================
+# Startup
+# =========================
+with app.app_context():
+    prewarm_tts()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
