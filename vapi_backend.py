@@ -581,7 +581,11 @@ def process():
     r = VoiceResponse()
 
     if interested:
+    if whatsapp_sent == "yes":
         r.say("מעולה, שלחתי לך הודעה בוואטסאפ. תודה ולהתראות.", language="he-IL")
+    else:
+        r.say("מעולה, קיבלתי את האישור שלך. הייתה בעיה בשליחת הוואטסאפ, אבל שמרתי את הפרטים ונחזור אליך.", language="he-IL")
+    r.hangup()
         r.hangup()
     else:
         r.say("לא קלטתי אישור ברור. אם תרצה פרטים, תגיד כן או שלח לי וואטסאפ.", language="he-IL")
