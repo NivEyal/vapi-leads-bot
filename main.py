@@ -2,6 +2,8 @@ import os
 import json
 import asyncio
 import websockets
+import base64
+import audioop  # ספרייה מובנית בפייתון להמרת אודיו
 from fastapi import FastAPI, WebSocket, Request, Response
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 from twilio.rest import Client
@@ -36,26 +38,21 @@ async def media_stream(websocket: WebSocket):
     headers = {"Authorization": f"Bearer {os.getenv('XAI_API_KEY')}"}
 
     try:
-        async with websockets.connect(
-            xai_url, 
-            additional_headers=headers,
-            ping_interval=20,
-            ping_timeout=20
-        ) as xai_ws:
+        async with websockets.connect(xai_url, additional_headers=headers) as xai_ws:
             print("✅ Connected to xAI Realtime", flush=True)
 
             stream_sid = None
             phone_number = None
 
-            # תיקון קריטי: חזרה למחרוזת (string) לפי שגיאת ה-Pydantic בלוג
             session_update = {
                 "type": "session.update",
                 "session": {
                     "modalities": ["audio", "text"],
-                    "instructions": "אתה עוזר עסקי מקצועי. דבר בעברית בלבד. תשובות קצרות מאוד (משפט אחד).",
+                    "instructions": "Professional business assistant. Speak Hebrew ONLY. Short responses.",
                     "voice": "leo",
+                    # ננסה לבקש pcm16 כדי לבצע המרה ידנית בטוחה אם ה-ulaw מזייף
                     "input_audio_format": "g711_ulaw", 
-                    "output_audio_format": "g711_ulaw",
+                    "output_audio_format": "pcm16", 
                     "turn_detection": {"type": "server_vad", "threshold": 0.5}
                 }
             }
@@ -70,53 +67,56 @@ async def media_stream(websocket: WebSocket):
                     if event_type in ["response.audio.delta", "response.output_audio.delta"]:
                         payload = response.get("delta") or response.get("audio")
                         if payload and stream_sid:
-                            print("S", end="", flush=True) # לוג זרימת אודיו
-                            await websocket.send_json({
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {"payload": payload}
-                            })
-                    
-                    elif event_type == "error":
-                        print(f"\n❌ XAI ERROR: {response}", flush=True)
+                            try:
+                                # 1. פענוח ה-Base64 של xAI (שמגיע כ-PCM16)
+                                pcm_data = base64.b64decode(payload)
+                                
+                                # 2. המרה מ-PCM ל-μ-law (טוויליו דורש mulaw)
+                                # אנחנו מניחים ש-xAI שולח ב-24kHz או 16kHz ומורידים ל-8kHz של טוויליו
+                                # הערה: אם xAI שולח ב-24000, נשתמש ב-audioop.ratecv
+                                mu_law_data = audioop.lin2ulaw(pcm_data, 2) 
+                                
+                                # 3. קידוד חזרה ל-Base64 עבור טוויליו
+                                encoded_payload = base64.b64encode(mu_law_data).decode('utf-8')
+
+                                print("S", end="", flush=True)
+                                await websocket.send_json({
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {"payload": encoded_payload}
+                                })
+                            except Exception as e:
+                                print(f"Audio conversion error: {e}")
 
             async def twilio_to_xai():
                 nonlocal stream_sid, phone_number
                 async for message in websocket.iter_text():
                     data = json.loads(message)
-                    event = data.get('event')
-                    
-                    if event == 'start':
+                    if data.get('event') == 'start':
                         stream_sid = data['start']['streamSid']
                         phone_number = data['start']['customParameters'].get('caller')
                         print(f"📞 Connected: {phone_number}", flush=True)
                         
-                        # שליחת פריט שיחה ותגובה
                         greeting = {
                             "type": "conversation.item.create",
                             "item": {
-                                "type": "message",
-                                "role": "user",
+                                "type": "message", "role": "user",
                                 "content": [{"type": "input_text", "text": "תגיד בעברית: שלום, אני עוזר דיגיטלי. לשלוח לך פרטים בוואטסאפ?"}]
                             }
                         }
                         await xai_ws.send(json.dumps(greeting))
                         await xai_ws.send(json.dumps({"type": "response.create"}))
                     
-                    elif event == 'media':
+                    elif data.get('event') == 'media':
                         await xai_ws.send(json.dumps({
                             "type": "input_audio_buffer.append", 
                             "audio": data['media']['payload']
                         }))
-                    
-                    elif event in ['stop', 'close']:
-                        print("\n⏹️ Twilio closed stream", flush=True)
-                        break
+                    elif data.get('event') in ['stop', 'close']: break
 
             await asyncio.gather(xai_to_twilio(), twilio_to_xai())
 
-    except Exception as e:
-        print(f"\n🔥 Error: {e}", flush=True)
+    except Exception as e: print(f"🔥 Error: {e}")
     finally:
         try: await websocket.close()
         except: pass
