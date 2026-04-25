@@ -1,19 +1,3 @@
-"""
-AI Sales Call Bot — Fast Architecture
-======================================
-Flow מהיר:
-  1. /voice     → Grok TTS ברכה (cached) + Gather עם Twilio STT (מהיר!)
-  2. /gather    → זיהוי מיידי מ-SpeechResult → WhatsApp → תגובה
-                  במקביל: שומר Grok STT ב-background thread (לאיכות לוגים)
-  3. /no-input  → ניסיון שני אם לא דיבר
-
-למה Gather ולא Record?
-  Record: המתנה לשתיקה (timeout 5s) + הורדה + STT = 10-16 שניות
-  Gather: תשובה מיידית ברגע שהמשתמש סיים לדבר = 1-3 שניות
-
-Grok STT עדיין רץ — אבל בbackground, לא חוסם את השיחה.
-"""
-
 from flask import Flask, request, Response, jsonify
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client
@@ -52,9 +36,6 @@ EXPECTED_HEADERS = [
     "whatsapp_sent", "whatsapp_sid", "stt_error", "openai_error", "tts_error",
 ]
 
-# =========================
-# Texts (קצרים = TTS מהיר יותר)
-# =========================
 GREETING_TEXT     = "שלום! רוצה לקבל פרטים בוואטסאפ? תגיד כן."
 SUCCESS_TEXT      = "מעולה! שלחתי לך עכשיו בוואטסאפ. תודה!"
 RETRY_TEXT        = "לא קלטתי. תגיד כן אם תרצה פרטים בוואטסאפ."
@@ -79,6 +60,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
 _google_info = {
     "type": env("GOOGLE_TYPE"),
     "project_id": env("GOOGLE_PROJECT_ID"),
@@ -92,6 +74,7 @@ _google_info = {
     "client_x509_cert_url": env("GOOGLE_CLIENT_X509_CERT_URL"),
     "universe_domain": env("GOOGLE_UNIVERSE_DOMAIN", "googleapis.com"),
 }
+
 sheet = None
 try:
     _creds = Credentials.from_service_account_info(_google_info, scopes=SCOPES)
@@ -113,6 +96,7 @@ def ensure_headers():
     try:
         if sheet.row_values(1) != EXPECTED_HEADERS:
             sheet.update("A1:N1", [EXPECTED_HEADERS])
+            print("✅ Headers fixed", flush=True)
     except Exception as e:
         print("🔥 HEADER FIX:", e, flush=True)
 
@@ -138,28 +122,32 @@ def get_sheet_rows():
 def normalize_phone(phone: str) -> str:
     if not phone:
         return ""
+
     if phone.startswith("whatsapp:"):
         return phone
+
     digits = re.sub(r"[^\d+]", "", phone)
+
     if digits.startswith("0"):
         digits = "+972" + digits[1:]
     elif digits.startswith("972"):
         digits = "+" + digits
     elif not digits.startswith("+"):
         digits = "+" + digits
+
     return f"whatsapp:{digits}"
 
 # =========================
-# Grok TTS (עם cache)
+# Grok TTS with cache
 # =========================
-_tts_cache: dict = {}
+_tts_cache = {}
 
 def grok_tts(text: str) -> str:
     if text in _tts_cache:
         url = _tts_cache[text]
         fname = url.split("/")[-1]
         if os.path.exists(os.path.join(AUDIO_DIR, fname)):
-            print(f"🎵 CACHE HIT: {text[:35]}", flush=True)
+            print(f"🎵 TTS CACHE HIT: {text[:40]}", flush=True)
             return url
 
     if not XAI_API_KEY:
@@ -167,17 +155,30 @@ def grok_tts(text: str) -> str:
 
     res = requests.post(
         "https://api.x.ai/v1/tts",
-        headers={"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"},
-        json={"text": text[:1000], "voice_id": GROK_TTS_VOICE, "language": GROK_TTS_LANGUAGE, "format": "mp3"},
+        headers={
+            "Authorization": f"Bearer {XAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "text": text[:1000],
+            "voice_id": GROK_TTS_VOICE,
+            "language": GROK_TTS_LANGUAGE,
+            "format": "mp3",
+        },
         timeout=15,
     )
+
     print(f"🔊 TTS {res.status_code} {len(res.content)}b", flush=True)
+
     if res.status_code != 200:
         raise RuntimeError(f"TTS {res.status_code}: {res.text[:150]}")
 
     fname = f"{uuid.uuid4()}.mp3"
-    with open(os.path.join(AUDIO_DIR, fname), "wb") as f:
+    path = os.path.join(AUDIO_DIR, fname)
+
+    with open(path, "wb") as f:
         f.write(res.content)
+
     url = f"{PUBLIC_BASE_URL}/audio/{fname}"
     _tts_cache[text] = url
     return url
@@ -185,60 +186,36 @@ def grok_tts(text: str) -> str:
 def prewarm_tts():
     if not XAI_API_KEY:
         return
-    for t in [GREETING_TEXT, SUCCESS_TEXT, RETRY_TEXT, FINAL_TEXT, NO_INTEREST_TEXT]:
-        try:
-            grok_tts(t)
-            print(f"🎵 Pre-warmed: {t[:45]}", flush=True)
-        except Exception as e:
-            print(f"⚠️ Prewarm: {e}", flush=True)
 
-def _play_or_say(r, text: str):
+    for text in [GREETING_TEXT, SUCCESS_TEXT, RETRY_TEXT, FINAL_TEXT, NO_INTEREST_TEXT]:
+        try:
+            grok_tts(text)
+            print(f"🎵 Pre-warmed: {text[:40]}", flush=True)
+        except Exception as e:
+            print(f"⚠️ Prewarm failed: {e}", flush=True)
+
+def play_or_say(target, text: str):
     try:
-        r.play(grok_tts(text))
+        target.play(grok_tts(text))
     except Exception as e:
         print(f"⚠️ TTS fallback: {e}", flush=True)
-        r.say(text, language="he-IL")
+        target.say(text, language="he-IL")
 
 @app.get("/audio/<fname>")
 def serve_audio(fname):
     path = os.path.join(AUDIO_DIR, fname)
+
     if not os.path.exists(path):
         return Response("not found", status=404)
+
     with open(path, "rb") as f:
         data = f.read()
-    return Response(data, mimetype="audio/mpeg",
-                    headers={"Cache-Control": "public, max-age=86400"})
 
-# =========================
-# Grok STT (רץ ב-background בלבד)
-# =========================
-def grok_stt_background(recording_url: str, call_sid: str, caller: str, twilio_text: str):
-    """
-    רץ ב-thread נפרד אחרי שכבר ענינו למשתמש.
-    מטרה: לשמור את הטקסט המדויק בגיליון לאיכות.
-    """
-    try:
-        audio = requests.get(
-            recording_url,
-            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-            timeout=20,
-        )
-        if audio.status_code != 200:
-            print(f"⚠️ STT download failed: {audio.status_code}", flush=True)
-            return
-        res = requests.post(
-            "https://api.x.ai/v1/stt",
-            headers={"Authorization": f"Bearer {XAI_API_KEY}"},
-            files={"file": ("rec.wav", audio.content, "audio/wav")},
-            timeout=30,
-        )
-        grok_text = res.json().get("text", "").strip() if res.status_code == 200 else ""
-        print(f"🎤 GROK STT (bg): {repr(grok_text)}", flush=True)
-        # עדכן את הגיליון עם הטקסט המדויק של Grok
-        if grok_text and grok_text != twilio_text:
-            print(f"📝 Grok improved text: '{twilio_text}' → '{grok_text}'", flush=True)
-    except Exception as e:
-        print(f"⚠️ STT background error: {e}", flush=True)
+    return Response(
+        data,
+        mimetype="audio/mpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 # =========================
 # WhatsApp
@@ -247,14 +224,18 @@ def send_whatsapp(to_phone: str, summary: str = "") -> str:
     if not twilio_client:
         raise RuntimeError("Twilio not initialized")
 
-    # וודא פורמט נכון של From
     from_num = TWILIO_WHATSAPP_FROM
+
     if not from_num:
-        raise RuntimeError("TWILIO_WHATSAPP_FROM missing — set env var to 'whatsapp:+14155238886' or your approved number")
+        raise RuntimeError(
+            "TWILIO_WHATSAPP_FROM missing. Use whatsapp:+14155238886 for sandbox or approved sender."
+        )
+
     if not from_num.startswith("whatsapp:"):
         from_num = f"whatsapp:{from_num}"
 
     to_num = normalize_phone(to_phone)
+
     print(f"📱 WA: {from_num} → {to_num}", flush=True)
 
     msg = twilio_client.messages.create(
@@ -267,18 +248,21 @@ def send_whatsapp(to_phone: str, summary: str = "") -> str:
             "נשמח לעזור ולתאם המשך!"
         ),
     )
+
     return msg.sid
 
 # =========================
 # Interest Detection
 # =========================
 YES_WORDS = [
-    "כן", "בטח", "ברור", "אפשר", "יאללה", "יאלה", "סבבה", "אוקיי", "אוקי",
-    "שלח", "תשלח", "תשלחי", "שלחו", "וואטסאפ", "ווטסאפ", "ווצאפ",
-    "מעוניין", "מעוניינת", "רוצה", "אשמח", "פרטים", "יכול", "נשמח", "קדימה",
-    "yes", "yeah", "yep", "ok", "okay", "sure", "please", "send",
-    "good", "great", "ken", "tov",   # תעתיקים שגויים נפוצים
+    "כן", "בטח", "ברור", "אפשר", "יאללה", "יאלה", "סבבה",
+    "אוקיי", "אוקי", "שלח", "תשלח", "תשלחי", "שלחו",
+    "וואטסאפ", "ווטסאפ", "ווצאפ", "מעוניין", "מעוניינת",
+    "רוצה", "אשמח", "פרטים", "יכול", "נשמח", "קדימה",
+    "yes", "yeah", "yep", "ok", "okay", "sure", "please",
+    "send", "good", "great", "ken", "tov",
 ]
+
 NO_WORDS = [
     "לא מעוניין", "לא מעוניינת", "לא רלוונטי", "לא תודה",
     "אל תשלח", "לא לשלוח", "תוריד", "עזוב",
@@ -288,207 +272,256 @@ NO_WORDS = [
 def detect_interest(text: str) -> bool:
     if not text:
         return False
+
     clean = re.sub(r"[^\w\u0590-\u05FF\s]", " ", text.lower().strip())
     clean = re.sub(r"\s+", " ", clean).strip()
+
     print(f"🔍 DETECT: '{clean}'", flush=True)
 
     for phrase in NO_WORDS:
         if phrase in clean:
-            print(f"❌ NO: '{phrase}'", flush=True)
+            print(f"❌ NO: {phrase}", flush=True)
             return False
 
     if re.search(r"(?<!\w)לא(?!\w)", clean):
-        strong = ["כן","בטח","ברור","אשמח","רוצה","yes","ok","okay","sure","good"]
-        if not any(re.search(rf"(?<!\w){re.escape(w)}(?!\w)", clean) for w in strong):
+        strong_yes = ["כן", "בטח", "ברור", "אשמח", "רוצה", "yes", "ok", "okay", "sure", "good"]
+        if not any(re.search(rf"(?<!\w){re.escape(w)}(?!\w)", clean) for w in strong_yes):
             print("❌ Standalone לא", flush=True)
             return False
 
     for word in YES_WORDS:
         if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", clean):
-            print(f"✅ YES: '{word}'", flush=True)
+            print(f"✅ YES: {word}", flush=True)
             return True
 
     print("⚪ No match", flush=True)
     return False
 
 # =========================
-# /voice  — שלב 1
+# Voice — no recording
 # =========================
 @app.post("/voice")
 def voice():
-    caller   = request.form.get("From", "")
+    caller = request.form.get("From", "")
     call_sid = request.form.get("CallSid", "")
-    print(f"📞 {caller} | {call_sid}", flush=True)
+
+    print(f"📞 Incoming: {caller} | {call_sid}", flush=True)
 
     r = VoiceResponse()
 
-    # Gather: ברכה בתוך gather = מאזין כבר בזמן ההשמעה
     gather = r.gather(
         input="speech",
         action="/gather",
         method="POST",
         language="he-IL",
-        speech_timeout=2,   # שניות שקט אחרי דיבור = מהיר!
-        timeout=12,          # המתנה מקסימלית לתחילת דיבור
+        speech_timeout=2,
+        timeout=12,
         hints=(
             "כן,בטח,ברור,סבבה,שלח,תשלח,וואטסאפ,אשמח,רוצה,"
             "yes,yeah,ok,okay,sure,good"
         ),
     )
-    # ברכה בתוך gather — Twilio מאזין תוך כדי ניגון
-    _play_or_say(gather, GREETING_TEXT)
 
-    # fallback אם לא ענה כלל
+    play_or_say(gather, GREETING_TEXT)
+
     r.redirect("/no-input")
+
     return Response(str(r), mimetype="text/xml")
 
-
 # =========================
-# /gather — שלב 2 (מהיר!)
+# Gather
 # =========================
 @app.post("/gather")
 def gather():
-    caller        = request.form.get("From", "")
-    call_sid      = request.form.get("CallSid", "")
-    speech_result = request.form.get("SpeechResult", "")   # Twilio STT מהיר
-    recording_url = request.form.get("RecordingUrl", "")   # אם הפעלת recording
+    caller = request.form.get("From", "")
+    call_sid = request.form.get("CallSid", "")
+    speech_result = request.form.get("SpeechResult", "")
 
     print(f"🎤 SPEECH: {repr(speech_result)} | {caller}", flush=True)
 
     interested = detect_interest(speech_result)
 
-    # Grok STT ב-background (לא חוסם!)
-    if recording_url and XAI_API_KEY:
-        threading.Thread(
-            target=grok_stt_background,
-            args=(recording_url, call_sid, caller, speech_result),
-            daemon=True,
-        ).start()
-
     wa_sent = "no"
-    wa_sid  = ""
+    wa_sid = ""
     summary = "הלקוח ביקש לקבל פרטים בוואטסאפ." if interested else "לא זוהה עניין."
 
     if interested and caller:
         try:
-            wa_sid  = send_whatsapp(caller, "נשמח להמשך שיחה ותיאום.")
+            wa_sid = send_whatsapp(caller, "נשמח להמשך שיחה ותיאום.")
             wa_sent = "yes"
             print(f"✅ WA sent → {caller} | {wa_sid}", flush=True)
         except Exception as e:
             wa_sent = f"failed:{str(e)[:120]}"
             print(f"🔥 WA ERROR: {e}", flush=True)
 
-    # שמור ב-background
     row = [
-        now_iso(), call_sid, caller, speech_result,
+        now_iso(),
+        call_sid,
+        caller,
+        speech_result,
         "yes" if interested else "no",
         "positive" if interested else "neutral",
         "hot" if interested else "cold",
         "send_whatsapp" if interested else "no_action",
-        summary, wa_sent, wa_sid, "", "", "",
+        summary,
+        wa_sent,
+        wa_sid,
+        "",
+        "",
+        "",
     ]
+
     threading.Thread(target=append_lead_row, args=(row,), daemon=True).start()
 
     r = VoiceResponse()
-    if interested:
-        _play_or_say(r, SUCCESS_TEXT)
-    else:
-        # ניסיון שני — gather קצר
-        gather2 = r.gather(
-            input="speech",
-            action="/gather-final",
-            method="POST",
-            language="he-IL",
-            speech_timeout=2,
-            timeout=8,
-            hints="כן,בטח,ברור,שלח,וואטסאפ,yes,ok,sure,good",
-        )
-        _play_or_say(gather2, RETRY_TEXT)
-        _play_or_say(r, NO_INTEREST_TEXT)
 
+    if interested:
+        if wa_sent == "yes":
+            play_or_say(r, SUCCESS_TEXT)
+        else:
+            play_or_say(
+                r,
+                "מעולה, קיבלתי את האישור שלך. הייתה בעיה בשליחת הוואטסאפ, אבל שמרתי את הפרטים ונחזור אליך.",
+            )
+        r.hangup()
+        return Response(str(r), mimetype="text/xml")
+
+    gather2 = r.gather(
+        input="speech",
+        action="/gather-final",
+        method="POST",
+        language="he-IL",
+        speech_timeout=2,
+        timeout=8,
+        hints="כן,בטח,ברור,שלח,וואטסאפ,yes,ok,sure,good",
+    )
+
+    play_or_say(gather2, RETRY_TEXT)
+    play_or_say(r, NO_INTEREST_TEXT)
     r.hangup()
+
     return Response(str(r), mimetype="text/xml")
 
-
 # =========================
-# /gather-final — ניסיון שני
+# Gather Final
 # =========================
 @app.post("/gather-final")
 def gather_final():
-    caller        = request.form.get("From", "")
-    call_sid      = request.form.get("CallSid", "")
+    caller = request.form.get("From", "")
+    call_sid = request.form.get("CallSid", "")
     speech_result = request.form.get("SpeechResult", "")
 
     print(f"🎤 FINAL: {repr(speech_result)} | {caller}", flush=True)
 
     interested = detect_interest(speech_result)
+
     wa_sent = "no"
-    wa_sid  = ""
+    wa_sid = ""
 
     if interested and caller:
         try:
-            wa_sid  = send_whatsapp(caller, "נשמח להמשך שיחה ותיאום.")
+            wa_sid = send_whatsapp(caller, "נשמח להמשך שיחה ותיאום.")
             wa_sent = "yes"
+            print(f"✅ WA sent final → {caller} | {wa_sid}", flush=True)
         except Exception as e:
             wa_sent = f"failed:{str(e)[:120]}"
-            print(f"🔥 WA ERROR (final): {e}", flush=True)
+            print(f"🔥 WA ERROR FINAL: {e}", flush=True)
 
     row = [
-        now_iso(), call_sid + "_retry", caller, speech_result,
+        now_iso(),
+        call_sid + "_retry",
+        caller,
+        speech_result,
         "yes" if interested else "no",
         "positive" if interested else "neutral",
         "hot" if interested else "cold",
         "send_whatsapp" if interested else "no_action",
-        "ניסיון שני" + (" - מעוניין" if interested else " - לא מעוניין"),
-        wa_sent, wa_sid, "", "", "",
+        "ניסיון שני - מעוניין" if interested else "ניסיון שני - לא מעוניין",
+        wa_sent,
+        wa_sid,
+        "",
+        "",
+        "",
     ]
+
     threading.Thread(target=append_lead_row, args=(row,), daemon=True).start()
 
     r = VoiceResponse()
-    _play_or_say(r, SUCCESS_TEXT if interested else FINAL_TEXT)
+
+    if interested:
+        if wa_sent == "yes":
+            play_or_say(r, SUCCESS_TEXT)
+        else:
+            play_or_say(
+                r,
+                "מעולה, קיבלתי את האישור שלך. הייתה בעיה בשליחת הוואטסאפ, אבל שמרתי את הפרטים ונחזור אליך.",
+            )
+    else:
+        play_or_say(r, FINAL_TEXT)
+
     r.hangup()
+
     return Response(str(r), mimetype="text/xml")
 
-
 # =========================
-# /no-input — לא ענה כלל
+# No Input
 # =========================
 @app.post("/no-input")
 def no_input():
-    caller   = request.form.get("From", "")
+    caller = request.form.get("From", "")
     call_sid = request.form.get("CallSid", "")
+
     print(f"🔇 No input | {caller}", flush=True)
 
     row = [
-        now_iso(), call_sid, caller, "",
-        "no", "neutral", "cold", "no_action",
-        "לא ענה", "no", "", "", "", "",
+        now_iso(),
+        call_sid,
+        caller,
+        "",
+        "no",
+        "neutral",
+        "cold",
+        "no_action",
+        "לא ענה",
+        "no",
+        "",
+        "",
+        "",
+        "",
     ]
+
     threading.Thread(target=append_lead_row, args=(row,), daemon=True).start()
 
     r = VoiceResponse()
-    _play_or_say(r, FINAL_TEXT)
+    play_or_say(r, FINAL_TEXT)
     r.hangup()
+
     return Response(str(r), mimetype="text/xml")
 
-
 # =========================
-# Test Endpoints
+# Tests
 # =========================
-
 @app.get("/test-whatsapp")
 def test_whatsapp():
     to = request.args.get("to", "").strip()
+
     if not to:
-        return jsonify({"ok": False, "error": "missing ?to=+972...",
-                        "tip": f"TWILIO_WHATSAPP_FROM={TWILIO_WHATSAPP_FROM!r}"})
+        return jsonify({
+            "ok": False,
+            "error": "missing ?to=+972...",
+            "twilio_whatsapp_from": TWILIO_WHATSAPP_FROM or "NOT SET",
+        })
+
     try:
         sid = send_whatsapp(to, "זו הודעת בדיקה.")
         return jsonify({"ok": True, "sid": sid})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e),
-                        "from": TWILIO_WHATSAPP_FROM,
-                        "tip": "TWILIO_WHATSAPP_FROM must be 'whatsapp:+14155238886' for sandbox"}), 500
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "from": TWILIO_WHATSAPP_FROM,
+            "tip": "For sandbox use TWILIO_WHATSAPP_FROM=whatsapp:+14155238886",
+        }), 500
 
 @app.get("/test-detect")
 def test_detect():
@@ -507,82 +540,151 @@ def test_tts():
 # =========================
 # Stats + Dashboard
 # =========================
-
 @app.get("/stats")
 def stats():
     rows = get_sheet_rows()
-    total      = len(rows)
-    interested = sum(1 for r in rows if str(r.get("interested","")).lower() == "yes")
-    wa_sent    = sum(1 for r in rows if str(r.get("whatsapp_sent","")).lower().startswith("yes"))
+
+    total = len(rows)
+    interested = sum(1 for r in rows if str(r.get("interested", "")).lower() == "yes")
+    wa_sent = sum(1 for r in rows if str(r.get("whatsapp_sent", "")).lower().startswith("yes"))
+
     return jsonify({
-        "ok": True, "total_calls": total, "interested": interested,
+        "ok": True,
+        "total_calls": total,
+        "interested": interested,
         "whatsapp_sent": wa_sent,
         "conversion_pct": round(interested / total * 100, 2) if total else 0,
     })
 
 @app.get("/dashboard")
 def dashboard():
-    rows       = get_sheet_rows()
-    total      = len(rows)
-    interested = sum(1 for r in rows if str(r.get("interested","")).lower() == "yes")
-    wa_sent    = sum(1 for r in rows if str(r.get("whatsapp_sent","")).lower().startswith("yes"))
+    rows = get_sheet_rows()
+
+    total = len(rows)
+    interested = sum(1 for r in rows if str(r.get("interested", "")).lower() == "yes")
+    wa_sent = sum(1 for r in rows if str(r.get("whatsapp_sent", "")).lower().startswith("yes"))
     conversion = round(interested / total * 100, 2) if total else 0
-    recent     = list(reversed(rows[-30:]))
+    recent = list(reversed(rows[-30:]))
 
     table_rows = ""
+
     for r in recent:
-        ib = "🟢 כן" if str(r.get("interested","")).lower() == "yes" else "🔴 לא"
-        wb = "🟢 נשלח" if str(r.get("whatsapp_sent","")).lower().startswith("yes") else "⚪ לא"
+        ib = "🟢 כן" if str(r.get("interested", "")).lower() == "yes" else "🔴 לא"
+        wb = "🟢 נשלח" if str(r.get("whatsapp_sent", "")).lower().startswith("yes") else "⚪ לא"
+
         table_rows += (
-            f"<tr><td>{r.get('timestamp','')}</td><td>{r.get('caller','')}</td>"
-            f"<td>{ib}</td><td>{wb}</td><td>{r.get('lead_quality','')}</td>"
-            f"<td>{r.get('sentiment','')}</td><td>{r.get('summary','')}</td>"
-            f"<td>{r.get('user_text','')}</td></tr>"
+            f"<tr>"
+            f"<td>{r.get('timestamp', '')}</td>"
+            f"<td>{r.get('caller', '')}</td>"
+            f"<td>{ib}</td>"
+            f"<td>{wb}</td>"
+            f"<td>{r.get('lead_quality', '')}</td>"
+            f"<td>{r.get('sentiment', '')}</td>"
+            f"<td>{r.get('summary', '')}</td>"
+            f"<td>{r.get('user_text', '')}</td>"
+            f"</tr>"
         )
 
-    html = f"""<!doctype html>
-<html lang="he" dir="rtl"><head><meta charset="utf-8"><title>AI Calls Dashboard</title>
+    html = f"""
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>AI Calls Dashboard</title>
 <style>
-body{{font-family:Arial;background:#f7f7f7;padding:24px}}
-.cards{{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:24px}}
-.card{{background:white;padding:18px;border-radius:12px;min-width:180px;box-shadow:0 2px 8px rgba(0,0,0,.08)}}
-.num{{font-size:30px;font-weight:bold;color:#333}}
-table{{width:100%;border-collapse:collapse;background:white;border-radius:8px;overflow:hidden}}
-th,td{{padding:10px 12px;border-bottom:1px solid #eee;vertical-align:top;font-size:13px}}
-th{{background:#111;color:white;font-weight:600}}
-tr:hover{{background:#f9f9f9}}
-</style></head><body>
-<h1 style="margin-bottom:20px">📊 דשבורד שיחות AI</h1>
+body {{
+    font-family: Arial;
+    background: #f7f7f7;
+    padding: 24px;
+}}
+.cards {{
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 24px;
+}}
+.card {{
+    background: white;
+    padding: 18px;
+    border-radius: 12px;
+    min-width: 180px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.08);
+}}
+.num {{
+    font-size: 30px;
+    font-weight: bold;
+    color: #333;
+}}
+table {{
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+    border-radius: 8px;
+    overflow: hidden;
+}}
+th, td {{
+    padding: 10px 12px;
+    border-bottom: 1px solid #eee;
+    vertical-align: top;
+    font-size: 13px;
+}}
+th {{
+    background: #111;
+    color: white;
+}}
+tr:hover {{
+    background: #f9f9f9;
+}}
+</style>
+</head>
+<body>
+<h1>📊 דשבורד שיחות AI</h1>
+
 <div class="cards">
-  <div class="card"><div style="color:#666;font-size:13px">סה״כ שיחות</div><div class="num">{total}</div></div>
-  <div class="card"><div style="color:#666;font-size:13px">מתעניינים</div><div class="num" style="color:#16a34a">{interested}</div></div>
-  <div class="card"><div style="color:#666;font-size:13px">וואטסאפ נשלח</div><div class="num" style="color:#2563eb">{wa_sent}</div></div>
-  <div class="card"><div style="color:#666;font-size:13px">המרה</div><div class="num" style="color:#d97706">{conversion}%</div></div>
+    <div class="card"><div>סה״כ שיחות</div><div class="num">{total}</div></div>
+    <div class="card"><div>מתעניינים</div><div class="num">{interested}</div></div>
+    <div class="card"><div>וואטסאפ נשלח</div><div class="num">{wa_sent}</div></div>
+    <div class="card"><div>המרה</div><div class="num">{conversion}%</div></div>
 </div>
-<table><tr>
-  <th>זמן</th><th>טלפון</th><th>עניין</th><th>וואטסאפ</th>
-  <th>איכות</th><th>סנטימנט</th><th>סיכום</th><th>מה אמר</th>
+
+<table>
+<tr>
+    <th>זמן</th>
+    <th>טלפון</th>
+    <th>עניין</th>
+    <th>וואטסאפ</th>
+    <th>איכות</th>
+    <th>סנטימנט</th>
+    <th>סיכום</th>
+    <th>מה אמר</th>
 </tr>
 {table_rows or '<tr><td colspan="8" style="text-align:center;padding:30px;color:#999">אין שיחות עדיין</td></tr>'}
-</table></body></html>"""
+</table>
+</body>
+</html>
+"""
+
     return Response(html, mimetype="text/html; charset=utf-8")
 
 # =========================
 # Health
 # =========================
-
 @app.get("/")
 def home():
     ensure_headers()
-    wa_from = TWILIO_WHATSAPP_FROM or "⚠️ NOT SET"
+
     return jsonify({
         "ok": True,
-        "service": "AI sales call bot v3",
-        "flow": "Gather(fast) → detect → WhatsApp | Grok STT in background",
-        "whatsapp_from": wa_from,
+        "service": "AI sales call bot v4 - no recording",
+        "flow": "Twilio Gather fast → detect interest → WhatsApp → Sheets",
+        "recording": "disabled",
+        "whatsapp_from": TWILIO_WHATSAPP_FROM or "NOT SET",
         "tts_voice": GROK_TTS_VOICE,
+        "tts_language": GROK_TTS_LANGUAGE,
         "routes": [
-            "/voice", "/dashboard", "/stats",
+            "/voice",
+            "/dashboard",
+            "/stats",
             "/test-whatsapp?to=+972...",
             "/test-detect?text=כן",
             "/test-tts?text=שלום",
