@@ -13,7 +13,6 @@ requests
 fastapi
 uvicorn[standard]
 websockets
-base64
 asyncio
 json
 python-multipart
