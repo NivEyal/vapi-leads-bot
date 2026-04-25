@@ -377,12 +377,55 @@ def process():
         stt_error = str(e)
         print("🔥 STT ERROR:", stt_error, flush=True)
 
-    text = user_text.lower()
+    print("🧠 USER TEXT RAW:", repr(user_text), flush=True)
 
-    interested = any(word in text for word in [
-        "כן", "בטח", "אפשר", "תשלח", "שלח", "וואטסאפ",
-        "מעוניין", "אשמח", "רוצה", "פרטים", "יאללה"
-    ])
+    clean_text = (user_text or "").strip().lower()
+    clean_text = re.sub(r"[^\w\u0590-\u05FF\s]", " ", clean_text)
+    clean_text = re.sub(r"\s+", " ", clean_text)
+
+    print("🧠 USER TEXT CLEAN:", clean_text, flush=True)
+
+    yes_keywords = [
+        "כן",
+        "כן כן",
+        "בטח",
+        "ברור",
+        "אפשר",
+        "יאללה",
+        "סבבה",
+        "אוקיי",
+        "אוקי",
+        "שלח",
+        "תשלח",
+        "תשלחי",
+        "שלחו",
+        "וואטסאפ",
+        "ווטסאפ",
+        "מעוניין",
+        "מעוניינת",
+        "רוצה",
+        "אשמח",
+        "פרטים",
+        "תשלח לי",
+        "שלח לי",
+    ]
+
+    no_keywords = [
+        "לא",
+        "לא תודה",
+        "לא מעוניין",
+        "לא רלוונטי",
+        "עזוב",
+        "תוריד",
+        "אל תשלח",
+        "לא לשלוח",
+    ]
+
+    interested = any(k in clean_text for k in yes_keywords)
+    rejected = any(k in clean_text for k in no_keywords)
+
+    if rejected:
+        interested = False
 
     summary = "הלקוח ביקש לקבל פרטים בוואטסאפ." if interested else "לא זוהה עניין ברור."
 
@@ -425,7 +468,16 @@ def process():
         r.say("מעולה, שלחתי לך הודעה בוואטסאפ. תודה ולהתראות.", language="he-IL")
         r.hangup()
     else:
-        r.say("תודה רבה. יום טוב.", language="he-IL")
+        r.say("לא קלטתי אישור ברור. אם תרצה פרטים, תגיד כן או שלח לי וואטסאפ.", language="he-IL")
+        r.record(
+            action="/process",
+            method="POST",
+            max_length=6,
+            timeout=4,
+            play_beep=False,
+            transcribe=False,
+        )
+        r.say("תודה רבה ולהתראות.", language="he-IL")
         r.hangup()
 
     return Response(str(r), mimetype="text/xml")
