@@ -16,3 +16,4 @@ websockets
 base64
 asyncio
 json
+python-multipart
