@@ -12,21 +12,41 @@ from datetime import datetime
 
 app = Flask(__name__)
 
+EXPECTED_HEADERS = [
+    "timestamp",
+    "call_sid",
+    "caller",
+    "user_text",
+    "interested",
+    "sentiment",
+    "lead_quality",
+    "next_action",
+    "summary",
+    "whatsapp_sent",
+    "whatsapp_sid",
+    "stt_error",
+    "openai_error",
+    "tts_error",
+]
+
 # =========================
 # ENV
 # =========================
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+def env(name, default=""):
+    return os.getenv(name, default).strip()
 
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_CALLER_ID = os.getenv("TWILIO_CALLER_ID")
-TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
+PUBLIC_BASE_URL = env("PUBLIC_BASE_URL").rstrip("/")
 
-XAI_API_KEY = os.getenv("XAI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+TWILIO_ACCOUNT_SID = env("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = env("TWILIO_AUTH_TOKEN")
+TWILIO_CALLER_ID = env("TWILIO_CALLER_ID")
+TWILIO_WHATSAPP_FROM = env("TWILIO_WHATSAPP_FROM")
 
-GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
+XAI_API_KEY = env("XAI_API_KEY")
+OPENAI_API_KEY = env("OPENAI_API_KEY")
+OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4.1-mini")
+
+GOOGLE_SHEETS_ID = env("GOOGLE_SHEETS_ID")
 
 AUDIO_DIR = "/tmp/audio"
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -36,8 +56,11 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 # =========================
 twilio_client = None
 try:
-    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    print("✅ Twilio connected", flush=True)
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+        twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        print("✅ Twilio connected", flush=True)
+    else:
+        print("⚠️ Twilio ENV missing", flush=True)
 except Exception as e:
     print("🔥 TWILIO ERROR:", str(e), flush=True)
 
@@ -50,17 +73,17 @@ SCOPES = [
 ]
 
 google_service_account_info = {
-    "type": os.getenv("GOOGLE_TYPE"),
-    "project_id": os.getenv("GOOGLE_PROJECT_ID"),
-    "private_key_id": os.getenv("GOOGLE_PRIVATE_KEY_ID"),
-    "private_key": os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n"),
-    "client_email": os.getenv("GOOGLE_CLIENT_EMAIL"),
-    "client_id": os.getenv("GOOGLE_CLIENT_ID"),
-    "auth_uri": os.getenv("GOOGLE_AUTH_URI"),
-    "token_uri": os.getenv("GOOGLE_TOKEN_URI"),
-    "auth_provider_x509_cert_url": os.getenv("GOOGLE_AUTH_PROVIDER_X509_CERT_URL"),
-    "client_x509_cert_url": os.getenv("GOOGLE_CLIENT_X509_CERT_URL"),
-    "universe_domain": os.getenv("GOOGLE_UNIVERSE_DOMAIN", "googleapis.com"),
+    "type": env("GOOGLE_TYPE"),
+    "project_id": env("GOOGLE_PROJECT_ID"),
+    "private_key_id": env("GOOGLE_PRIVATE_KEY_ID"),
+    "private_key": os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n").strip(),
+    "client_email": env("GOOGLE_CLIENT_EMAIL"),
+    "client_id": env("GOOGLE_CLIENT_ID"),
+    "auth_uri": env("GOOGLE_AUTH_URI"),
+    "token_uri": env("GOOGLE_TOKEN_URI"),
+    "auth_provider_x509_cert_url": env("GOOGLE_AUTH_PROVIDER_X509_CERT_URL"),
+    "client_x509_cert_url": env("GOOGLE_CLIENT_X509_CERT_URL"),
+    "universe_domain": env("GOOGLE_UNIVERSE_DOMAIN", "googleapis.com"),
 }
 
 sheet = None
@@ -80,6 +103,34 @@ except Exception as e:
 # =========================
 def now_iso():
     return datetime.utcnow().isoformat()
+
+def ensure_headers():
+    if sheet is None:
+        return False
+
+    try:
+        current = sheet.row_values(1)
+
+        if current != EXPECTED_HEADERS:
+            sheet.update("A1:N1", [EXPECTED_HEADERS])
+            print("✅ Google Sheets headers fixed", flush=True)
+
+        return True
+    except Exception as e:
+        print("🔥 HEADER FIX ERROR:", str(e), flush=True)
+        return False
+
+def get_sheet_rows():
+    if sheet is None:
+        return []
+
+    ensure_headers()
+
+    try:
+        return sheet.get_all_records(expected_headers=EXPECTED_HEADERS)
+    except Exception as e:
+        print("🔥 GET ROWS ERROR:", str(e), flush=True)
+        return []
 
 def normalize_phone_for_whatsapp(phone: str) -> str:
     if not phone:
@@ -104,6 +155,7 @@ def append_lead_row(row: list):
         print("⚠️ Google Sheet not connected", flush=True)
         return False
 
+    ensure_headers()
     sheet.append_row(row, value_input_option="USER_ENTERED")
     return True
 
@@ -111,7 +163,7 @@ def safe_json_loads(text: str) -> dict:
     try:
         return json.loads(text)
     except Exception:
-        match = re.search(r"\{.*\}", text, re.S)
+        match = re.search(r"\{.*\}", text or "", re.S)
         if match:
             try:
                 return json.loads(match.group(0))
@@ -156,7 +208,7 @@ def grok_stt(recording_url: str) -> str:
     audio_res = requests.get(
         recording_url,
         auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-        timeout=20,
+        timeout=25,
     )
 
     if audio_res.status_code != 200:
@@ -166,15 +218,11 @@ def grok_stt(recording_url: str) -> str:
         "file": ("recording.wav", audio_res.content, "audio/wav")
     }
 
-    headers = {
-        "Authorization": f"Bearer {XAI_API_KEY}",
-    }
-
     res = requests.post(
         "https://api.x.ai/v1/stt",
-        headers=headers,
+        headers={"Authorization": f"Bearer {XAI_API_KEY}"},
         files=files,
-        timeout=40,
+        timeout=45,
     )
 
     if res.status_code != 200:
@@ -239,7 +287,7 @@ def openai_analyze(user_text: str, caller: str = "") -> dict:
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=40,
+        timeout=45,
     )
 
     if res.status_code != 200:
@@ -280,19 +328,20 @@ def grok_tts(text: str) -> str:
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=40,
+        timeout=45,
     )
 
     if res.status_code != 200:
         raise RuntimeError(f"Grok TTS error {res.status_code}: {res.text}")
 
     file_id = str(uuid.uuid4())
-    path = os.path.join(AUDIO_DIR, f"{file_id}.mp3")
+    file_name = f"{file_id}.mp3"
+    path = os.path.join(AUDIO_DIR, file_name)
 
     with open(path, "wb") as f:
         f.write(res.content)
 
-    return f"{PUBLIC_BASE_URL}/audio/{file_id}.mp3"
+    return f"{PUBLIC_BASE_URL}/audio/{file_name}"
 
 # =========================
 # Audio route
@@ -351,7 +400,6 @@ def process():
     recording_url = request.form.get("RecordingUrl", "")
 
     user_text = ""
-    analysis = {}
     whatsapp_sent = "no"
     whatsapp_sid = ""
     tts_error = ""
@@ -361,8 +409,6 @@ def process():
     try:
         if recording_url:
             user_text = grok_stt(recording_url + ".wav")
-        else:
-            user_text = ""
     except Exception as e:
         stt_error = str(e)
         print("🔥 STT ERROR:", stt_error, flush=True)
@@ -373,11 +419,11 @@ def process():
         openai_error = str(e)
         print("🔥 OPENAI ERROR:", openai_error, flush=True)
         analysis = {
-            "reply": "תודה, אני שולח לך פרטים בוואטסאפ.",
+            "reply": "תודה, לא הצלחתי להבין עד הסוף. אפשר לשלוח לך פרטים בוואטסאפ?",
             "interested": False,
             "sentiment": "neutral",
             "summary": "OpenAI failed",
-            "next_action": "no_action",
+            "next_action": "continue_call",
             "lead_quality": "cold",
         }
 
@@ -395,6 +441,16 @@ def process():
         except Exception as e:
             whatsapp_sent = f"failed: {str(e)[:120]}"
             print("🔥 WHATSAPP ERROR:", str(e), flush=True)
+
+    r = VoiceResponse()
+
+    try:
+        audio_url = grok_tts(reply)
+        r.play(audio_url)
+    except Exception as e:
+        tts_error = str(e)
+        print("🔥 TTS ERROR:", tts_error, flush=True)
+        r.say(reply, language="he-IL", voice="alice")
 
     row = [
         now_iso(),
@@ -418,16 +474,6 @@ def process():
     except Exception as e:
         print("🔥 SHEET APPEND ERROR:", str(e), flush=True)
 
-    r = VoiceResponse()
-
-    try:
-        audio_url = grok_tts(reply)
-        r.play(audio_url)
-    except Exception as e:
-        tts_error = str(e)
-        print("🔥 TTS ERROR:", tts_error, flush=True)
-        r.say(reply, language="he-IL", voice="alice")
-
     if interested:
         r.say("שלחתי לך הודעה. תודה רבה ולהתראות.", language="he-IL", voice="alice")
         r.hangup()
@@ -450,7 +496,7 @@ def process():
 # =========================
 @app.get("/test-whatsapp")
 def test_whatsapp():
-    to = request.args.get("to", "")
+    to = request.args.get("to", "").strip()
 
     if not to:
         return jsonify({"ok": False, "error": "missing ?to=+972..."})
@@ -472,7 +518,7 @@ def stats():
     if sheet is None:
         return jsonify({"ok": False, "error": "Google Sheets not connected"}), 500
 
-    rows = sheet.get_all_records()
+    rows = get_sheet_rows()
 
     total = len(rows)
     interested = sum(1 for r in rows if str(r.get("interested", "")).lower() == "yes")
@@ -508,24 +554,7 @@ def dashboard():
             status=500,
         )
 
-    EXPECTED_HEADERS = [
-    "timestamp",
-    "call_sid",
-    "caller",
-    "user_text",
-    "interested",
-    "sentiment",
-    "lead_quality",
-    "next_action",
-    "summary",
-    "whatsapp_sent",
-    "whatsapp_sid",
-    "stt_error",
-    "openai_error",
-    "tts_error",
-]
-
-rows = sheet.get_all_records(expected_headers=EXPECTED_HEADERS)
+    rows = get_sheet_rows()
 
     total = len(rows)
     interested = sum(1 for r in rows if str(r.get("interested", "")).lower() == "yes")
@@ -658,6 +687,7 @@ rows = sheet.get_all_records(expected_headers=EXPECTED_HEADERS)
 # =========================
 @app.get("/")
 def home():
+    ensure_headers()
     return jsonify({
         "ok": True,
         "service": "AI sales call bot",
