@@ -366,11 +366,9 @@ def process():
     recording_url = request.form.get("RecordingUrl", "")
 
     user_text = ""
+    stt_error = ""
     whatsapp_sent = "no"
     whatsapp_sid = ""
-    stt_error = ""
-    openai_error = ""
-    tts_error = ""
 
     try:
         if recording_url:
@@ -379,45 +377,25 @@ def process():
         stt_error = str(e)
         print("🔥 STT ERROR:", stt_error, flush=True)
 
-    try:
-        analysis = openai_analyze(user_text, caller=caller)
-    except Exception as e:
-        openai_error = str(e)
-        print("🔥 OPENAI ERROR:", openai_error, flush=True)
-        analysis = {
-            "reply": "תודה, לא הצלחתי להבין עד הסוף. אפשר לשלוח לך פרטים בוואטסאפ?",
-            "interested": False,
-            "sentiment": "neutral",
-            "summary": "OpenAI failed",
-            "next_action": "continue_call",
-            "lead_quality": "cold",
-        }
+    text = user_text.lower()
 
-    interested = analysis.get("interested", False)
-    reply = analysis.get("reply", "תודה רבה.")
-    summary = analysis.get("summary", "")
+    interested = any(word in text for word in [
+        "כן", "בטח", "אפשר", "תשלח", "שלח", "וואטסאפ",
+        "מעוניין", "אשמח", "רוצה", "פרטים", "יאללה"
+    ])
+
+    summary = "הלקוח ביקש לקבל פרטים בוואטסאפ." if interested else "לא זוהה עניין ברור."
 
     if interested and caller:
         try:
             whatsapp_sid = send_whatsapp(
                 to_phone=caller,
-                summary=summary or "נשמח להמשך שיחה ותיאום.",
+                summary="נשמח להמשך שיחה ותיאום."
             )
             whatsapp_sent = "yes"
         except Exception as e:
             whatsapp_sent = f"failed: {str(e)[:120]}"
             print("🔥 WHATSAPP ERROR:", str(e), flush=True)
-
-    r = VoiceResponse()
-
-    try:
-        audio_url = grok_tts(reply)
-        print("🔊 REPLY AUDIO:", audio_url, flush=True)
-        r.play(audio_url)
-    except Exception as e:
-        tts_error = str(e)
-        print("🔥 TTS ERROR:", tts_error, flush=True)
-        r.say(reply, language="he-IL")
 
     row = [
         now_iso(),
@@ -425,15 +403,15 @@ def process():
         caller,
         user_text,
         "yes" if interested else "no",
-        analysis.get("sentiment", ""),
-        analysis.get("lead_quality", ""),
-        analysis.get("next_action", ""),
+        "positive" if interested else "neutral",
+        "hot" if interested else "cold",
+        "send_whatsapp" if interested else "no_action",
         summary,
         whatsapp_sent,
         whatsapp_sid,
         stt_error,
-        openai_error,
-        tts_error,
+        "",
+        "",
     ]
 
     try:
@@ -441,23 +419,13 @@ def process():
     except Exception as e:
         print("🔥 SHEET APPEND ERROR:", str(e), flush=True)
 
+    r = VoiceResponse()
+
     if interested:
-        try:
-            end_audio = grok_tts("שלחתי לך הודעה. תודה רבה ולהתראות.")
-            r.play(end_audio)
-        except Exception:
-            r.say("שלחתי לך הודעה. תודה רבה ולהתראות.", language="he-IL")
+        r.say("מעולה, שלחתי לך הודעה בוואטסאפ. תודה ולהתראות.", language="he-IL")
         r.hangup()
     else:
-        r.record(
-            action="/process",
-            method="POST",
-            max_length=10,
-            timeout=5,
-            play_beep=True,
-            transcribe=False,
-        )
-        r.say("תודה רבה ולהתראות.", language="he-IL")
+        r.say("תודה רבה. יום טוב.", language="he-IL")
         r.hangup()
 
     return Response(str(r), mimetype="text/xml")
