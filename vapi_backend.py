@@ -335,24 +335,127 @@ def voice():
     try:
         audio_url = grok_tts(greeting)
         print("🔊 GREETING AUDIO:", audio_url, flush=True)
-        r.play(audio_url)
+
+        gather = r.gather(
+            input="speech",
+            action="/gather",
+            method="POST",
+            language="he-IL",
+            speech_timeout="auto",
+            timeout=5,
+        )
+        gather.play(audio_url)
+
     except Exception as e:
         print("🔥 GREETING TTS ERROR:", str(e), flush=True)
-        r.say("שלום. תרצה שאשלח לך פרטים בוואטסאפ?", language="he-IL")
 
-    r.pause(length=1)
+        gather = r.gather(
+            input="speech",
+            action="/gather",
+            method="POST",
+            language="he-IL",
+            speech_timeout="auto",
+            timeout=5,
+        )
+        gather.say("שלום, תרצה שאשלח לך פרטים בוואטסאפ?", language="he-IL")
 
-    r.record(
-        action="/process",
-        method="POST",
-        max_length=10,
-        timeout=5,
-        play_beep=True,
-        transcribe=False,
-    )
-
-    r.say("תודה ולהתראות.", language="he-IL")
+    r.say("לא התקבלה תשובה. תודה ולהתראות.", language="he-IL")
     r.hangup()
+
+    return Response(str(r), mimetype="text/xml")
+
+
+@app.post("/gather")
+def gather():
+    caller = request.form.get("From", "")
+    call_sid = request.form.get("CallSid", "")
+    speech_result = request.form.get("SpeechResult", "")
+
+    print("🧠 TWILIO SPEECH RAW:", repr(speech_result), flush=True)
+
+    clean_text = (speech_result or "").strip().lower()
+    clean_text = re.sub(r"[^\w\u0590-\u05FF\s]", " ", clean_text)
+    clean_text = re.sub(r"\s+", " ", clean_text)
+
+    print("🧠 TWILIO SPEECH CLEAN:", clean_text, flush=True)
+
+    yes_keywords = [
+        "כן", "בטח", "ברור", "אפשר", "יאללה", "סבבה",
+        "אוקיי", "אוקי", "שלח", "תשלח", "וואטסאפ", "ווטסאפ",
+        "מעוניין", "מעוניינת", "רוצה", "אשמח", "פרטים",
+        "yes", "yeah", "yep", "ok", "okay", "sure"
+    ]
+
+    no_keywords = [
+        "לא", "לא תודה", "לא מעוניין", "לא רלוונטי",
+        "עזוב", "תוריד", "אל תשלח", "לא לשלוח",
+        "no", "no thanks"
+    ]
+
+    interested = any(k in clean_text for k in yes_keywords)
+    rejected = any(k in clean_text for k in no_keywords)
+
+    if rejected:
+        interested = False
+
+    whatsapp_sent = "no"
+    whatsapp_sid = ""
+    summary = "הלקוח ביקש לקבל פרטים בוואטסאפ." if interested else "לא זוהה עניין ברור."
+
+    if interested and caller:
+        try:
+            whatsapp_sid = send_whatsapp(
+                to_phone=caller,
+                summary="נשמח להמשך שיחה ותיאום."
+            )
+            whatsapp_sent = "yes"
+        except Exception as e:
+            whatsapp_sent = f"failed: {str(e)[:120]}"
+            print("🔥 WHATSAPP ERROR:", str(e), flush=True)
+
+    row = [
+        now_iso(),
+        call_sid,
+        caller,
+        speech_result,
+        "yes" if interested else "no",
+        "positive" if interested else "neutral",
+        "hot" if interested else "cold",
+        "send_whatsapp" if interested else "no_action",
+        summary,
+        whatsapp_sent,
+        whatsapp_sid,
+        "",
+        "",
+        "",
+    ]
+
+    try:
+        append_lead_row(row)
+    except Exception as e:
+        print("🔥 SHEET APPEND ERROR:", str(e), flush=True)
+
+    r = VoiceResponse()
+
+    if interested:
+        r.say("מעולה, שלחתי לך הודעה בוואטסאפ. תודה ולהתראות.", language="he-IL")
+        r.hangup()
+    else:
+        gather_retry = r.gather(
+            input="speech",
+            action="/gather",
+            method="POST",
+            language="he-IL",
+            speech_timeout="auto",
+            timeout=5,
+        )
+        gather_retry.say(
+            "לא קלטתי אישור ברור. תגיד כן אם תרצה שאשלח לך פרטים בוואטסאפ.",
+            language="he-IL",
+        )
+
+        r.say("תודה רבה ולהתראות.", language="he-IL")
+        r.hangup()
 
     return Response(str(r), mimetype="text/xml")
 
