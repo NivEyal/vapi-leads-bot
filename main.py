@@ -11,13 +11,10 @@ from google.oauth2.service_account import Credentials
 
 app = FastAPI()
 
-# --- הגדרות סביבה ובדיקות תקינות ---
+# --- הגדרות סביבה ---
 BOT_LANGUAGE = os.getenv("BOT_LANGUAGE", "he").strip()
 BOT_LOCALE = os.getenv("BOT_LOCALE", "he-IL").strip()
 BASE_URL = os.getenv("PUBLIC_BASE_URL", "").replace("https://", "").replace("http://", "").rstrip("/")
-
-if not BASE_URL:
-    print("⚠️ WARNING: PUBLIC_BASE_URL is not set. WebSocket connections will fail.", flush=True)
 
 LANGUAGE_INSTRUCTIONS = {
     "he": """
@@ -29,7 +26,7 @@ LANGUAGE_INSTRUCTIONS = {
     "en": "Default language is English. Keep it short.",
 }
 
-# --- פונקציות עזר ונורמליזציה ---
+# --- פונקציות עזר ---
 
 def normalize_whatsapp_number(phone):
     if not phone: return ""
@@ -38,8 +35,6 @@ def normalize_whatsapp_number(phone):
     elif phone.startswith("972"): phone = "+" + phone
     elif not phone.startswith("+"): phone = "+" + phone
     return f"whatsapp:{phone}"
-
-# --- אתחול משאבים ---
 
 def init_sheets():
     try:
@@ -60,7 +55,6 @@ SHEET = init_sheets()
 TWILIO_CLIENT = Client(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
 
 def send_whatsapp_logic(to_number):
-    """מחזיר True אם נשלח בהצלחה"""
     if not to_number: return False
     formatted_number = normalize_whatsapp_number(to_number)
     try:
@@ -76,15 +70,11 @@ def send_whatsapp_logic(to_number):
         print(f"❌ WhatsApp Error: {e}", flush=True)
         return False
 
-# --- Endpoints ל-Health Check ---
+# --- Endpoints ---
 
 @app.get("/")
 def home():
-    return {
-        "ok": True,
-        "service": "Grok-Twilio-Bridge",
-        "language": BOT_LANGUAGE
-    }
+    return {"ok": True, "service": "Grok-Twilio-Bridge"}
 
 @app.get("/healthz")
 def healthz():
@@ -94,42 +84,41 @@ def healthz():
 async def handle_voice(request: Request):
     form = await request.form()
     caller = form.get("From", "Unknown")
-    
     resp = VoiceResponse()
     connect = Connect()
-    
     stream = Stream(url=f"wss://{BASE_URL}/media-stream")
     stream.parameter(name="caller", value=caller)
-    
     connect.append(stream)
     resp.append(connect)
     return Response(content=str(resp), media_type="application/xml")
 
-# --- WebSocket Main Logic ---
+# --- WebSocket Logic ---
 
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     await websocket.accept()
-    print("🚀 Connection accepted", flush=True)
+    print("🚀 Twilio WebSocket Connected", flush=True)
 
     xai_url = "wss://api.x.ai/v1/realtime"
-    headers = {"Authorization": f"Bearer {os.getenv('XAI_API_KEY')}"}
+    headers = {
+        "Authorization": f"Bearer {os.getenv('XAI_API_KEY')}"
+    }
 
     try:
+        # תיקון: שימוש ב-additional_headers והוספת ping לשיפור יציבות
         async with websockets.connect(
-            xai_url,
+            xai_url, 
             additional_headers=headers,
             ping_interval=20,
-            ping_timeout=20,
+            ping_timeout=20
         ) as xai_ws:
-            print("✅ Connected to xAI realtime", flush=True)
+            print("✅ Connected to xAI Realtime", flush=True)
 
             stream_sid = None
             phone_number = None
             whatsapp_sent_once = False
 
-
-            # הגדרת סשן מול Grok
+            # עדכון סשן
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -138,18 +127,18 @@ async def media_stream(websocket: WebSocket):
 {LANGUAGE_INSTRUCTIONS.get(BOT_LANGUAGE, LANGUAGE_INSTRUCTIONS["he"])}
 מטרת השיחה: להציע פרטים בוואטסאפ על עוזר דיגיטלי ב-10 שקלים ליום.
 אם הלקוח אומר כן / תשלח / אוקיי:
-1. הפעל את הכלי send_whatsapp (חובה להפעיל את הכלי!).
-2. רק אחרי ההפעלה, אמור: "מעולה, שלחתי לך עכשיו הודעה."
-אם הלקוח אומר לא: אמור "תודה ולהתראות" ואל תפעיל את הכלי.
+1. הפעל את הכלי send_whatsapp.
+2. אמור: "מעולה, שלחתי לך עכשיו הודעה."
+אם הלקוח אומר לא: אמור "תודה ולהתראות" ואל תשלח כלום.
 """,
                     "voice": os.getenv("GROK_VOICE", "leo"),
                     "input_audio_format": "g711_ulaw",
                     "output_audio_format": "g711_ulaw",
-                    "turn_detection": {"type": "server_vad", "threshold": 0.45},
+                    "turn_detection": {"type": "server_vad", "threshold": 0.5},
                     "tools": [{
                         "type": "function",
                         "name": "send_whatsapp",
-                        "description": "שולח הודעת וואטסאפ עם פרטים ללקוח",
+                        "description": "שולח הודעת וואטסאפ ללקוח",
                         "parameters": {"type": "object", "properties": {}}
                     }]
                 }
@@ -162,6 +151,9 @@ async def media_stream(websocket: WebSocket):
                     response = json.loads(message)
                     event_type = response.get("type")
                     
+                    # לוג אירועים מ-xAI
+                    print(f"XAI EVENT: {event_type}", flush=True)
+                    
                     if event_type in ["response.audio.delta", "response.output_audio.delta"]:
                         payload = response.get("delta") or response.get("audio")
                         if payload and stream_sid:
@@ -173,16 +165,11 @@ async def media_stream(websocket: WebSocket):
                     if event_type == "response.function_call_arguments.done":
                         call_id = response.get("call_id")
                         if response.get("name") == "send_whatsapp":
-                            ok = False
-                            if not whatsapp_sent_once:
-                                ok = send_whatsapp_logic(phone_number)
-                                whatsapp_sent_once = True
-                            else:
-                                ok = True # מניעת שליחה כפולה, אך החזרת הצלחה למודל
-
+                            res = send_whatsapp_logic(phone_number) if not whatsapp_sent_once else True
+                            whatsapp_sent_once = True
                             await xai_ws.send(json.dumps({
                                 "type": "conversation.item.create",
-                                "item": {"type": "function_call_output", "call_id": call_id, "output": "success" if ok else "failed"}
+                                "item": {"type": "function_call_output", "call_id": call_id, "output": "success" if res else "failed"}
                             }))
                             await xai_ws.send(json.dumps({"type": "response.create"}))
 
@@ -195,14 +182,14 @@ async def media_stream(websocket: WebSocket):
                     if event == 'start':
                         stream_sid = data['start']['streamSid']
                         phone_number = data['start']['customParameters'].get('caller')
-                        print(f"📞 Started: {phone_number}", flush=True)
+                        print(f"📞 Incoming call from: {phone_number}", flush=True)
                         
                         greeting = {
                             "type": "conversation.item.create",
                             "item": {
                                 "type": "message",
                                 "role": "user",
-                                "content": [{"type": "input_text", "text": "פתח בדיוק כך: שלום, אני עוזר דיגיטלי שחוסך זמן בטלפונים ובוואטסאפ. לשלוח לך פרטים בוואטסאפ?"}]
+                                "content": [{"type": "input_text", "text": "תגיד בדיוק: שלום, אני עוזר דיגיטלי שחוסך זמן בטלפונים ובוואטסאפ. לשלוח לך פרטים בוואטסאפ?"}]
                             }
                         }
                         await xai_ws.send(json.dumps(greeting))
@@ -212,15 +199,12 @@ async def media_stream(websocket: WebSocket):
                         await xai_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": data['media']['payload']}))
                     
                     elif event in ['stop', 'close']:
-                        print(f"⏹️ Twilio Stream {event}", flush=True)
                         break
 
             await asyncio.gather(xai_to_twilio(), twilio_to_xai())
 
     except Exception as e:
-        print(f"🔥 Error: {e}", flush=True)
+        print(f"🔥 Error in Media Stream: {e}", flush=True)
     finally:
-        try:
-            await websocket.close()
-        except:
-            pass
+        try: await websocket.close()
+        except: pass
