@@ -47,14 +47,15 @@ async def media_stream(websocket: WebSocket):
             stream_sid = None
             phone_number = None
 
+            # תיקון קריטי: חזרה למחרוזת (string) לפי שגיאת ה-Pydantic בלוג
             session_update = {
                 "type": "session.update",
                 "session": {
                     "modalities": ["audio", "text"],
-                    "instructions": "You are a professional business assistant. Speak ONLY in Hebrew. Keep answers very short (1 sentence).",
+                    "instructions": "אתה עוזר עסקי מקצועי. דבר בעברית בלבד. תשובות קצרות מאוד (משפט אחד).",
                     "voice": "leo",
-                    "input_audio_format": {"type": "audio/pcmu"},
-                    "output_audio_format": {"type": "audio/pcmu"},
+                    "input_audio_format": "g711_ulaw", 
+                    "output_audio_format": "g711_ulaw",
                     "turn_detection": {"type": "server_vad", "threshold": 0.5}
                 }
             }
@@ -69,8 +70,7 @@ async def media_stream(websocket: WebSocket):
                     if event_type in ["response.audio.delta", "response.output_audio.delta"]:
                         payload = response.get("delta") or response.get("audio")
                         if payload and stream_sid:
-                            # לוג לראות שיש אודיו שיוצא
-                            print("S", end="", flush=True) 
+                            print("S", end="", flush=True) # לוג זרימת אודיו
                             await websocket.send_json({
                                 "event": "media",
                                 "streamSid": stream_sid,
@@ -91,7 +91,7 @@ async def media_stream(websocket: WebSocket):
                         phone_number = data['start']['customParameters'].get('caller')
                         print(f"📞 Connected: {phone_number}", flush=True)
                         
-                        # יצירת אירוע דיבור ראשוני
+                        # שליחת פריט שיחה ותגובה
                         greeting = {
                             "type": "conversation.item.create",
                             "item": {
@@ -101,7 +101,6 @@ async def media_stream(websocket: WebSocket):
                             }
                         }
                         await xai_ws.send(json.dumps(greeting))
-                        # הכרחי: בקשת תגובה מהמודל
                         await xai_ws.send(json.dumps({"type": "response.create"}))
                     
                     elif event == 'media':
