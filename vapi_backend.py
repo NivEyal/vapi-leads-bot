@@ -426,8 +426,14 @@ def openai_analyze(user_text, caller=""):
 
 
 # =========================
-# ✅ IMPROVED: Voice Start - מהיר יותר, say כ-fallback מהיר
+# ✅ FIXED: Voice Start
+# הברכה + ההאזנה בתוך Gather אחד - Twilio מאזין כבר בזמן ההשמעה
 # =========================
+HINTS = (
+    "כן,בטח,ברור,סבבה,שלח,תשלח,וואטסאפ,yes,yeah,ok,okay,sure,"
+    "אשמח,רוצה,מעוניין,מעוניינת,אפשר,יאללה,פרטים,נשמח"
+)
+
 @app.post("/voice")
 def voice():
     caller = request.form.get("From", "")
@@ -437,31 +443,29 @@ def voice():
 
     r = VoiceResponse()
 
-    # נסה להשתמש בקובץ pre-warmed - אחרת say מהיר
-    try:
-        audio_url = grok_tts(GREETING_TEXT)
-        print("🔊 GREETING AUDIO:", audio_url, flush=True)
-        r.play(audio_url)
-    except Exception as e:
-        print("🔥 GREETING TTS ERROR:", str(e), flush=True)
-        r.say(GREETING_TEXT, language="he-IL")
-
-    r.pause(length=1)
-
+    # ✅ הכל בתוך gather אחד:
+    # Twilio מתחיל להאזין מיד עם תחילת ההשמעה.
+    # אם המשתמש מדבר תוך כדי - זה נתפס!
     gather = r.gather(
         input="speech",
         action="/gather",
         method="POST",
         language="he-IL",
-        speech_timeout="auto",
-        timeout=8,
-        hints=(
-            "כן,בטח,ברור,סבבה,שלח,תשלח,וואטסאפ,yes,yeah,ok,okay,sure,"
-            "אשמח,רוצה,מעוניין,מעוניינת,אפשר,יאללה,פרטים"
-        ),
+        speech_timeout=3,        # שניות שקט אחרי דיבור → סיום
+        timeout=15,              # שניות המתנה לתחילת דיבור
+        hints=HINTS,
     )
-    gather.say("אני מקשיב.", language="he-IL")
 
+    # הברכה בתוך ה-gather
+    try:
+        audio_url = grok_tts(GREETING_TEXT)
+        print("🔊 GREETING AUDIO (in gather):", audio_url, flush=True)
+        gather.play(audio_url)
+    except Exception as e:
+        print("🔥 GREETING TTS ERROR:", str(e), flush=True)
+        gather.say(GREETING_TEXT, language="he-IL")
+
+    # אם timeout עבר בלי דיבור - עבור ל-voice-timeout
     r.redirect("/voice-timeout")
 
     return Response(str(r), mimetype="text/xml")
@@ -471,30 +475,23 @@ def voice():
 def voice_timeout():
     r = VoiceResponse()
 
+    # ניסיון שני - גם כאן הכל בתוך gather
+    gather = r.gather(
+        input="speech",
+        action="/gather",
+        method="POST",
+        language="he-IL",
+        speech_timeout=3,
+        timeout=12,
+        hints=HINTS,
+    )
+
     try:
-        audio_url = grok_tts(RETRY_TEXT)
-        gather = r.gather(
-            input="speech",
-            action="/gather",
-            method="POST",
-            language="he-IL",
-            speech_timeout="auto",
-            timeout=10,
-            hints="כן,בטח,ברור,סבבה,שלח,תשלח,וואטסאפ,yes,yeah,ok,sure,אשמח,רוצה",
-        )
-        gather.play(audio_url)
+        gather.play(grok_tts(RETRY_TEXT))
     except Exception:
-        gather = r.gather(
-            input="speech",
-            action="/gather",
-            method="POST",
-            language="he-IL",
-            speech_timeout="auto",
-            timeout=10,
-            hints="כן,בטח,ברור,סבבה,שלח,תשלח,וואטסאפ,yes,yeah,ok,sure,אשמח,רוצה",
-        )
         gather.say(RETRY_TEXT, language="he-IL")
 
+    # אם עדיין אין תגובה - סיום
     try:
         r.play(grok_tts(FINAL_TEXT))
     except Exception:
