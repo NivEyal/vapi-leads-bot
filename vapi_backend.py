@@ -1,32 +1,48 @@
-from flask import Flask, request, jsonify, Response, send_file
-from datetime import datetime
+from flask import Flask, request, Response, jsonify
+from twilio.twiml.voice_response import VoiceResponse
+from twilio.rest import Client
+from google.oauth2.service_account import Credentials
+import gspread
+import requests
 import os
 import re
-import io
-import requests
+import uuid
+import json
+from datetime import datetime
 
-from twilio.rest import Client
-import gspread
-from google.oauth2.service_account import Credentials
-
-# =========================
-# App
-# =========================
 app = Flask(__name__)
 
 # =========================
 # ENV
 # =========================
-TWILIO_ACCOUNT_SID    = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN     = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_FROM  = os.getenv("TWILIO_WHATSAPP_FROM")
-VAPI_WEBHOOK_SECRET   = os.getenv("VAPI_WEBHOOK_SECRET")
-GOOGLE_SHEETS_ID      = os.getenv("GOOGLE_SHEETS_ID")
-AZURE_TTS_KEY         = os.getenv("AZURE_TTS_KEY")
-AZURE_TTS_REGION      = os.getenv("AZURE_TTS_REGION", "westeurope")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_CALLER_ID = os.getenv("TWILIO_CALLER_ID")
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
+
+XAI_API_KEY = os.getenv("XAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
+GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
+
+AUDIO_DIR = "/tmp/audio"
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
 # =========================
-# Google Service Account
+# Twilio Client
+# =========================
+twilio_client = None
+try:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    print("✅ Twilio connected", flush=True)
+except Exception as e:
+    print("🔥 TWILIO ERROR:", str(e), flush=True)
+
+# =========================
+# Google Sheets
 # =========================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -34,22 +50,20 @@ SCOPES = [
 ]
 
 google_service_account_info = {
-    "type":                        os.getenv("GOOGLE_TYPE"),
-    "project_id":                  os.getenv("GOOGLE_PROJECT_ID"),
-    "private_key_id":              os.getenv("GOOGLE_PRIVATE_KEY_I"),
-    "private_key":                 os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n"),
-    "client_email":                os.getenv("GOOGLE_CLIENT_EMAIL"),
-    "client_id":                   os.getenv("GOOGLE_CLIENT_ID"),
-    "auth_uri":                    os.getenv("GOOGLE_AUTH_URI"),
-    "token_uri":                   os.getenv("GOOGLE_TOKEN_URI"),
+    "type": os.getenv("GOOGLE_TYPE"),
+    "project_id": os.getenv("GOOGLE_PROJECT_ID"),
+    "private_key_id": os.getenv("GOOGLE_PRIVATE_KEY_ID"),
+    "private_key": os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n"),
+    "client_email": os.getenv("GOOGLE_CLIENT_EMAIL"),
+    "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+    "auth_uri": os.getenv("GOOGLE_AUTH_URI"),
+    "token_uri": os.getenv("GOOGLE_TOKEN_URI"),
     "auth_provider_x509_cert_url": os.getenv("GOOGLE_AUTH_PROVIDER_X509_CERT_URL"),
-    "client_x509_cert_url":        os.getenv("GOOGLE_CLIENT_X509_CERT_URL"),
-    "universe_domain":             os.getenv("GOOGLE_UNIVERSE_DOMAIN", "googleapis.com"),
+    "client_x509_cert_url": os.getenv("GOOGLE_CLIENT_X509_CERT_URL"),
+    "universe_domain": os.getenv("GOOGLE_UNIVERSE_DOMAIN", "googleapis.com"),
 }
 
-# =========================
-# Google Sheets client
-# =========================
+sheet = None
 try:
     creds = Credentials.from_service_account_info(
         google_service_account_info,
@@ -60,243 +74,322 @@ try:
     print("✅ Google Sheets connected", flush=True)
 except Exception as e:
     print("🔥 GOOGLE SHEETS ERROR:", str(e), flush=True)
-    sheet = None
-
-# =========================
-# Twilio client
-# =========================
-try:
-    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-except Exception as e:
-    print("🔥 TWILIO ERROR:", str(e), flush=True)
-    twilio_client = None
 
 # =========================
 # Helpers
 # =========================
-INTEREST_KEYWORDS = [
-    "כן", "מעוניין", "תשלח", "שלח לי", "תשלחו",
-    "וואטסאפ", "פרטים", "אשמח", "אשמח לקבל", "דבר איתי",
-]
-
-def is_interested(text: str) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    return any(k.lower() in t for k in INTEREST_KEYWORDS)
+def now_iso():
+    return datetime.utcnow().isoformat()
 
 def normalize_phone_for_whatsapp(phone: str) -> str:
     if not phone:
         return ""
+
     if phone.startswith("whatsapp:"):
         return phone
+
     digits = re.sub(r"[^\d+]", "", phone)
+
     if digits.startswith("0"):
         digits = "+972" + digits[1:]
+    elif digits.startswith("972"):
+        digits = "+" + digits
     elif not digits.startswith("+"):
         digits = "+" + digits
+
     return f"whatsapp:{digits}"
 
 def append_lead_row(row: list):
     if sheet is None:
-        print("⚠️ Sheet is not connected. Row not saved.", flush=True)
+        print("⚠️ Google Sheet not connected", flush=True)
         return False
+
     sheet.append_row(row, value_input_option="USER_ENTERED")
     return True
 
+def safe_json_loads(text: str) -> dict:
+    try:
+        return json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, re.S)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except Exception:
+                pass
+    return {}
+
+# =========================
+# WhatsApp
+# =========================
 def send_whatsapp(to_phone: str, business_name: str = "", summary: str = ""):
     if twilio_client is None:
         raise RuntimeError("Twilio client not initialized")
+
+    if not TWILIO_WHATSAPP_FROM:
+        raise RuntimeError("TWILIO_WHATSAPP_FROM missing")
+
     to_whatsapp = normalize_phone_for_whatsapp(to_phone)
+
     body = (
-        f"היי{(' ' + business_name) if business_name else ''}, תודה על השיחה.\n"
-        f"כמו שביקשת, הנה הפרטים להמשך.\n"
-        f"{summary}"
+        f"היי{(' ' + business_name) if business_name else ''}, תודה על השיחה 🙏\n\n"
+        f"כמו שביקשת, הנה הפרטים להמשך:\n"
+        f"{summary}\n\n"
+        f"נשמח לעזור ולתאם המשך."
     )
+
     msg = twilio_client.messages.create(
         from_=TWILIO_WHATSAPP_FROM,
         to=to_whatsapp,
         body=body,
     )
+
     return msg.sid
 
-def is_authorized(req) -> bool:
-    auth_header = req.headers.get("Authorization", "")
-    expected = f"Bearer {VAPI_WEBHOOK_SECRET}"
-    return auth_header == expected
-def fix_hebrew_tts(text: str) -> str:
-    # ניקוד חכם למילים בעייתיות בלבד (לא הכל!)
-    replacements = {
-        "שלום": "שָׁלוֹם",
-        "היי": "הַיי",
-        "מדבר": "מְדַבֵּר",
-        "ניב": "נִיב",
-        "תודה": "תוֹדָה",
-        "השיחה": "הַשִּׂיחָה",
-        "כמו שביקשת": "כְּמוֹ שֶׁבִּיקַּשְׁתָּ",
-        "הנה הפרטים": "הִנֵּה הַפְּרָטִים",
-        "להמשך": "לְהֶמְשֵׁךְ",
-        "תור": "תוֹר",
-        "לקביעת תור": "לִקְבִּיעַת תוֹר",
-        "שלחתי": "שָׁלַחְתִּי",
-        "לך": "לְךָ",
-        "וואטסאפ": "וָואטְסְאַפּ",
-        "נשמח": "נִשְׂמַח",
-        "להמשך שיחה": "לְהֶמְשֵׁךְ שִׂיחָה",
-        "ותיאום": "וְתִיאוּם",
+# =========================
+# Grok / xAI STT
+# =========================
+def grok_stt(recording_url: str) -> str:
+    if not XAI_API_KEY:
+        raise RuntimeError("XAI_API_KEY missing")
+
+    audio_res = requests.get(
+        recording_url,
+        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+        timeout=20,
+    )
+
+    if audio_res.status_code != 200:
+        raise RuntimeError(f"Could not download recording: {audio_res.status_code}")
+
+    files = {
+        "file": ("recording.wav", audio_res.content, "audio/wav")
     }
-
-    for k, v in replacements.items():
-        text = text.replace(k, v)
-
-    return text
-def azure_tts(text: str, voice: str = "he-IL-AvriNeural", output_format: str = "raw-16khz-16bit-mono-pcm") -> bytes:
-    url = f"https://{AZURE_TTS_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
 
     headers = {
-        "Ocp-Apim-Subscription-Key": AZURE_TTS_KEY,
-        "Content-Type": "application/ssml+xml",
-        "X-Microsoft-OutputFormat": output_format,
-        "User-Agent": "vapi-tts",
+        "Authorization": f"Bearer {XAI_API_KEY}",
     }
 
-    # 👉 ניקוד חכם
-    text = fix_hebrew_tts(text)
-
-    # 👉 SSML מקצועי (זה מה שמשפר באמת)
-    ssml = f"""
-    <speak version='1.0' xml:lang='he-IL'>
-        <voice name='{voice}'>
-            <prosody rate="0.95" pitch="+0%">
-                {text}
-            </prosody>
-        </voice>
-    </speak>
-    """
-
-    res = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=8)
+    res = requests.post(
+        "https://api.x.ai/v1/stt",
+        headers=headers,
+        files=files,
+        timeout=40,
+    )
 
     if res.status_code != 200:
-        raise RuntimeError(f"Azure TTS error {res.status_code}: {res.text}")
+        raise RuntimeError(f"Grok STT error {res.status_code}: {res.text}")
 
-    return res.content
-# =========================
-# Health
-# =========================
-@app.get("/")
-def home():
-    return {"status": "server running", "message": "Vapi backend is live"}, 200
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}, 200
+    data = res.json()
+    return data.get("text", "").strip()
 
 # =========================
-# Azure TTS test - browser
+# OpenAI Thinking + Lead Analysis
 # =========================
-@app.get("/test-tts")
-def test_tts():
-    if not AZURE_TTS_KEY:
-        return {"ok": False, "error": "AZURE_TTS_KEY not set"}, 500
-    try:
-        audio = azure_tts(
-            text="שלום, מדבר ניב. זה טסט למערכת.",
-            voice="he-IL-AvriNeural",
-            output_format="audio-16khz-32kbitrate-mono-mp3",
-        )
-        return send_file(
-            io.BytesIO(audio),
-            mimetype="audio/mpeg",
-            as_attachment=False,
-            download_name="speech.mp3",
-        )
-    except Exception as e:
-        return {"ok": False, "error": str(e)}, 500
+SYSTEM_PROMPT = """
+אתה נציג מכירות טלפוני בעברית לעסקים קטנים.
 
-# =========================
-# Custom TTS endpoint for Vapi
-# =========================
-@app.post("/vapi-tts")
-def vapi_tts():
-    if not AZURE_TTS_KEY:
-        return Response(b"", mimetype="application/octet-stream")
+המטרה:
+1. להבין אם הלקוח מעוניין.
+2. לענות קצר, טבעי וברור.
+3. אם הלקוח אומר כן / מעוניין / תשלח לי / שלח וואטסאפ / דבר איתי / אשמח / רוצה פרטים — סמן interested=true.
+4. אם הלקוח מסרב, עסוק, לא רלוונטי, או מבקש לא לפנות — סמן interested=false.
+5. אם יש עניין, כתוב תשובת קול קצרה שאומרת שנשלח לו וואטסאפ.
+6. אל תישמע כמו רובוט.
+7. אל תכתוב יותר מ־2 משפטים בתשובת הקול.
 
-    data = request.get_json(silent=True) or {}
-    print("🔥 VAPI TTS REQUEST:", data, flush=True)
+חובה להחזיר JSON בלבד בפורמט הבא:
+{
+  "reply": "תשובה קולית קצרה ללקוח",
+  "interested": true,
+  "sentiment": "positive / neutral / negative",
+  "summary": "סיכום קצר של השיחה",
+  "next_action": "send_whatsapp / continue_call / no_action",
+  "lead_quality": "hot / warm / cold"
+}
+"""
 
-    message = data.get("message", {}) or {}
-    text = message.get("text") or data.get("text") or ""
+def openai_analyze(user_text: str, caller: str = "") -> dict:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY missing")
 
-    if not text:
-        return Response(b"", mimetype="application/octet-stream")
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": f"""
+מספר לקוח: {caller}
 
-    text = text[:300]
+הלקוח אמר:
+{user_text}
+""",
+            },
+        ],
+    }
 
-    voice = (
-        data.get("voiceId")
-        or message.get("voiceId")
-        or "he-IL-AvriNeural"
+    res = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=40,
     )
 
-    try:
-        audio = azure_tts(text=text, voice=voice, output_format="raw-16khz-16bit-mono-pcm")
-        return Response(audio, mimetype="application/octet-stream")
-    except Exception as e:
-        print("🔥 AZURE TTS ERROR:", str(e), flush=True)
-        return Response(b"", mimetype="application/octet-stream")
+    if res.status_code != 200:
+        raise RuntimeError(f"OpenAI error {res.status_code}: {res.text}")
+
+    data = res.json()
+    text = data.get("output_text", "").strip()
+    parsed = safe_json_loads(text)
+
+    return {
+        "reply": parsed.get("reply", "תודה, אני שולח לך פרטים בוואטסאפ."),
+        "interested": bool(parsed.get("interested", False)),
+        "sentiment": parsed.get("sentiment", "neutral"),
+        "summary": parsed.get("summary", user_text[:200]),
+        "next_action": parsed.get("next_action", "continue_call"),
+        "lead_quality": parsed.get("lead_quality", "cold"),
+        "raw": text,
+    }
 
 # =========================
-# Webhook from Vapi
+# Grok / xAI TTS - Leo
 # =========================
-@app.post("/webhooks/vapi")
-def vapi_webhook():
-    if not is_authorized(request):
-        print("❌ Unauthorized webhook", flush=True)
-        return jsonify({"error": "unauthorized"}), 401
+def grok_tts(text: str) -> str:
+    if not XAI_API_KEY:
+        raise RuntimeError("XAI_API_KEY missing")
 
-    data = request.get_json(silent=True) or {}
-    message = data.get("message", {})
-    msg_type = message.get("type")
+    payload = {
+        "text": text[:1500],
+        "voice_id": "leo",
+        "language": "auto",
+        "format": "mp3",
+    }
 
-    print("🔥 MESSAGE TYPE:", msg_type, flush=True)
-
-    if msg_type != "end-of-call-report":
-        return ("", 204)
-
-    call         = message.get("call", {}) or {}
-    artifact     = message.get("artifact", {}) or {}
-    call_id      = call.get("id", "")
-    phone_number = (
-        call.get("customer", {}).get("number")
-        or call.get("phoneNumber")
-        or ""
-    )
-    business_name = call.get("customer", {}).get("name", "") or ""
-    ended_reason  = message.get("endedReason", "")
-    transcript    = artifact.get("transcript") or call.get("transcript") or ""
-
-    interested = is_interested(transcript)
-    answered   = ended_reason not in [
-        "customer-did-not-answer",
-        "assistant-not-available",
-        "assistant-request-returned-no-assistant",
-    ]
-
-    summary = (
-        "הלקוח הביע עניין וביקש פרטים בוואטסאפ."
-        if interested
-        else "לא זוהה עניין ברור."
+    res = requests.post(
+        "https://api.x.ai/v1/tts",
+        headers={
+            "Authorization": f"Bearer {XAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=40,
     )
 
+    if res.status_code != 200:
+        raise RuntimeError(f"Grok TTS error {res.status_code}: {res.text}")
+
+    file_id = str(uuid.uuid4())
+    path = os.path.join(AUDIO_DIR, f"{file_id}.mp3")
+
+    with open(path, "wb") as f:
+        f.write(res.content)
+
+    return f"{PUBLIC_BASE_URL}/audio/{file_id}.mp3"
+
+# =========================
+# Audio route
+# =========================
+@app.get("/audio/<file_name>")
+def serve_audio(file_name):
+    path = os.path.join(AUDIO_DIR, file_name)
+
+    if not os.path.exists(path):
+        return Response("not found", status=404)
+
+    with open(path, "rb") as f:
+        audio = f.read()
+
+    return Response(audio, mimetype="audio/mpeg")
+
+# =========================
+# Twilio Voice Entry
+# =========================
+@app.post("/voice")
+def voice():
+    caller = request.form.get("From", "")
+    call_sid = request.form.get("CallSid", "")
+
+    print(f"📞 Incoming call from {caller} | {call_sid}", flush=True)
+
+    r = VoiceResponse()
+
+    r.say(
+        "שלום, מדבר עוזר דיגיטלי שעוזר לעסקים לא לפספס לקוחות. תרצה שאשלח לך פרטים בוואטסאפ?",
+        language="he-IL",
+        voice="alice",
+    )
+
+    r.record(
+        action="/process",
+        method="POST",
+        max_length=12,
+        timeout=4,
+        play_beep=True,
+        transcribe=False,
+    )
+
+    r.say("לא התקבלה תשובה. תודה ולהתראות.", language="he-IL", voice="alice")
+    r.hangup()
+
+    return Response(str(r), mimetype="text/xml")
+
+# =========================
+# Process recording
+# =========================
+@app.post("/process")
+def process():
+    caller = request.form.get("From", "")
+    call_sid = request.form.get("CallSid", "")
+    recording_url = request.form.get("RecordingUrl", "")
+
+    user_text = ""
+    analysis = {}
     whatsapp_sent = "no"
-    whatsapp_sid  = ""
+    whatsapp_sid = ""
+    tts_error = ""
+    stt_error = ""
+    openai_error = ""
 
-    if interested and phone_number:
+    try:
+        if recording_url:
+            user_text = grok_stt(recording_url + ".wav")
+        else:
+            user_text = ""
+    except Exception as e:
+        stt_error = str(e)
+        print("🔥 STT ERROR:", stt_error, flush=True)
+
+    try:
+        analysis = openai_analyze(user_text, caller=caller)
+    except Exception as e:
+        openai_error = str(e)
+        print("🔥 OPENAI ERROR:", openai_error, flush=True)
+        analysis = {
+            "reply": "תודה, אני שולח לך פרטים בוואטסאפ.",
+            "interested": False,
+            "sentiment": "neutral",
+            "summary": "OpenAI failed",
+            "next_action": "no_action",
+            "lead_quality": "cold",
+        }
+
+    interested = analysis.get("interested", False)
+    reply = analysis.get("reply", "תודה רבה.")
+    summary = analysis.get("summary", "")
+
+    if interested and caller:
         try:
-            whatsapp_sid  = send_whatsapp(
-                to_phone=phone_number,
-                business_name=business_name,
-                summary="נשמח להמשך שיחה ותיאום.",
+            whatsapp_sid = send_whatsapp(
+                to_phone=caller,
+                summary=summary or "נשמח להמשך שיחה ותיאום.",
             )
             whatsapp_sent = "yes"
         except Exception as e:
@@ -304,24 +397,75 @@ def vapi_webhook():
             print("🔥 WHATSAPP ERROR:", str(e), flush=True)
 
     row = [
-        datetime.utcnow().isoformat(),
-        call_id,
-        phone_number,
-        business_name,
-        "yes" if answered else "no",
+        now_iso(),
+        call_sid,
+        caller,
+        user_text,
         "yes" if interested else "no",
+        analysis.get("sentiment", ""),
+        analysis.get("lead_quality", ""),
+        analysis.get("next_action", ""),
         summary,
-        transcript[:4000],
         whatsapp_sent,
         whatsapp_sid,
-        ended_reason,
+        stt_error,
+        openai_error,
+        tts_error,
     ]
 
-    append_lead_row(row)
-    return ("", 204)
+    try:
+        append_lead_row(row)
+    except Exception as e:
+        print("🔥 SHEET APPEND ERROR:", str(e), flush=True)
+
+    r = VoiceResponse()
+
+    try:
+        audio_url = grok_tts(reply)
+        r.play(audio_url)
+    except Exception as e:
+        tts_error = str(e)
+        print("🔥 TTS ERROR:", tts_error, flush=True)
+        r.say(reply, language="he-IL", voice="alice")
+
+    if interested:
+        r.say("שלחתי לך הודעה. תודה רבה ולהתראות.", language="he-IL", voice="alice")
+        r.hangup()
+    else:
+        r.record(
+            action="/process",
+            method="POST",
+            max_length=12,
+            timeout=4,
+            play_beep=True,
+            transcribe=False,
+        )
+        r.say("תודה רבה ולהתראות.", language="he-IL", voice="alice")
+        r.hangup()
+
+    return Response(str(r), mimetype="text/xml")
 
 # =========================
-# Stats
+# Manual test WhatsApp
+# =========================
+@app.get("/test-whatsapp")
+def test_whatsapp():
+    to = request.args.get("to", "")
+
+    if not to:
+        return jsonify({"ok": False, "error": "missing ?to=+972..."})
+
+    try:
+        sid = send_whatsapp(
+            to_phone=to,
+            summary="זו הודעת בדיקה מהמערכת.",
+        )
+        return jsonify({"ok": True, "sid": sid})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# =========================
+# Stats API
 # =========================
 @app.get("/stats")
 def stats():
@@ -329,16 +473,27 @@ def stats():
         return jsonify({"ok": False, "error": "Google Sheets not connected"}), 500
 
     rows = sheet.get_all_records()
-    total_calls     = len(rows)
-    answered_calls  = sum(1 for r in rows if str(r.get("answered", "")).lower() == "yes")
-    interested_calls = sum(1 for r in rows if str(r.get("interested", "")).lower() == "yes")
+
+    total = len(rows)
+    interested = sum(1 for r in rows if str(r.get("interested", "")).lower() == "yes")
+    whatsapp_sent = sum(1 for r in rows if str(r.get("whatsapp_sent", "")).lower().startswith("yes"))
+
+    hot = sum(1 for r in rows if str(r.get("lead_quality", "")).lower() == "hot")
+    warm = sum(1 for r in rows if str(r.get("lead_quality", "")).lower() == "warm")
+    cold = sum(1 for r in rows if str(r.get("lead_quality", "")).lower() == "cold")
 
     return jsonify({
-        "total_calls":                    total_calls,
-        "answered_calls":                 answered_calls,
-        "interested_calls":               interested_calls,
-        "interest_rate_from_total_pct":   round((interested_calls / total_calls) * 100, 2) if total_calls else 0,
-        "interest_rate_from_answered_pct": round((interested_calls / answered_calls) * 100, 2) if answered_calls else 0,
+        "ok": True,
+        "total_calls": total,
+        "interested": interested,
+        "whatsapp_sent": whatsapp_sent,
+        "conversion_pct": round((interested / total) * 100, 2) if total else 0,
+        "whatsapp_send_pct": round((whatsapp_sent / interested) * 100, 2) if interested else 0,
+        "lead_quality": {
+            "hot": hot,
+            "warm": warm,
+            "cold": cold,
+        }
     })
 
 # =========================
@@ -347,68 +502,157 @@ def stats():
 @app.get("/dashboard")
 def dashboard():
     if sheet is None:
-        return Response("<h1>Google Sheets not connected</h1>", mimetype="text/html; charset=utf-8", status=500)
+        return Response(
+            "<h1>Google Sheets not connected</h1>",
+            mimetype="text/html; charset=utf-8",
+            status=500,
+        )
 
     rows = sheet.get_all_records()
-    total        = len(rows)
-    answered     = sum(1 for r in rows if str(r.get("answered", "")).lower() == "yes")
-    interested   = sum(1 for r in rows if str(r.get("interested", "")).lower() == "yes")
+
+    total = len(rows)
+    interested = sum(1 for r in rows if str(r.get("interested", "")).lower() == "yes")
     whatsapp_sent = sum(1 for r in rows if str(r.get("whatsapp_sent", "")).lower().startswith("yes"))
 
-    conversion_total    = round((interested / total) * 100, 2) if total else 0
-    conversion_answered = round((interested / answered) * 100, 2) if answered else 0
+    conversion = round((interested / total) * 100, 2) if total else 0
+    wa_rate = round((whatsapp_sent / interested) * 100, 2) if interested else 0
 
-    recent_rows = list(reversed(rows[-20:])) if rows else []
+    recent_rows = list(reversed(rows[-30:]))
 
     table_rows = ""
     for r in recent_rows:
         interested_badge = "🟢 כן" if str(r.get("interested", "")).lower() == "yes" else "🔴 לא"
-        answered_badge   = "🟢 כן" if str(r.get("answered", "")).lower() == "yes" else "🔴 לא"
-        wa_badge         = "🟢 נשלח" if str(r.get("whatsapp_sent", "")).lower().startswith("yes") else "⚪ לא"
+        wa_badge = "🟢 נשלח" if str(r.get("whatsapp_sent", "")).lower().startswith("yes") else "⚪ לא"
+        quality = r.get("lead_quality", "")
+
         table_rows += f"""
         <tr>
-            <td>{r.get("timestamp","")}</td>
-            <td>{r.get("business_name","")}</td>
-            <td>{r.get("phone_number","")}</td>
-            <td>{answered_badge}</td>
+            <td>{r.get("timestamp", "")}</td>
+            <td>{r.get("caller", "")}</td>
             <td>{interested_badge}</td>
             <td>{wa_badge}</td>
-            <td>{r.get("ended_reason","")}</td>
-            <td style="max-width:420px;white-space:normal;">{r.get("summary","")}</td>
-        </tr>"""
+            <td>{quality}</td>
+            <td>{r.get("sentiment", "")}</td>
+            <td style="max-width:360px;white-space:normal;">{r.get("summary", "")}</td>
+            <td style="max-width:360px;white-space:normal;">{r.get("user_text", "")}</td>
+        </tr>
+        """
 
-    html = f"""<!doctype html>
+    html = f"""
+<!doctype html>
 <html lang="he" dir="rtl">
 <head>
     <meta charset="utf-8">
-    <title>Lead Dashboard</title>
+    <title>AI Calls Dashboard</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            background: #f7f7f7;
+            padding: 24px;
+            color: #222;
+        }}
+        .cards {{
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            margin-bottom: 24px;
+        }}
+        .card {{
+            background: white;
+            border-radius: 12px;
+            padding: 18px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            min-width: 180px;
+        }}
+        .num {{
+            font-size: 30px;
+            font-weight: bold;
+            margin-top: 6px;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 12px;
+            overflow: hidden;
+        }}
+        th, td {{
+            border-bottom: 1px solid #eee;
+            padding: 10px;
+            vertical-align: top;
+        }}
+        th {{
+            background: #111;
+            color: white;
+        }}
+    </style>
 </head>
-<body style="font-family:Arial;padding:24px;">
-    <h1>דשבורד לידים</h1>
-    <p>סטטוס שיחות, התעניינות ושליחת וואטסאפ</p>
-    <p><b>סה״כ שיחות:</b> {total}</p>
-    <p><b>שיחות שנענו:</b> {answered}</p>
-    <p><b>מתעניינים:</b> {interested}</p>
-    <p><b>וואטסאפ נשלח:</b> {whatsapp_sent}</p>
-    <p><b>המרה מכלל השיחות:</b> {conversion_total}%</p>
-    <p><b>המרה מתוך מי שענה:</b> {conversion_answered}%</p>
-    <h2>20 הלידים האחרונים</h2>
-    <table border="1" cellpadding="6" cellspacing="0">
+<body>
+    <h1>דשבורד שיחות AI</h1>
+
+    <div class="cards">
+        <div class="card">
+            <div>סה״כ שיחות</div>
+            <div class="num">{total}</div>
+        </div>
+        <div class="card">
+            <div>מתעניינים</div>
+            <div class="num">{interested}</div>
+        </div>
+        <div class="card">
+            <div>וואטסאפ נשלח</div>
+            <div class="num">{whatsapp_sent}</div>
+        </div>
+        <div class="card">
+            <div>המרה</div>
+            <div class="num">{conversion}%</div>
+        </div>
+        <div class="card">
+            <div>שליחת וואטסאפ מתוך מתעניינים</div>
+            <div class="num">{wa_rate}%</div>
+        </div>
+    </div>
+
+    <h2>30 השיחות האחרונות</h2>
+
+    <table>
         <tr>
-            <th>זמן</th><th>עסק</th><th>טלפון</th>
-            <th>ענה</th><th>התעניין</th><th>וואטסאפ</th>
-            <th>סיבת סיום</th><th>סיכום</th>
+            <th>זמן</th>
+            <th>טלפון</th>
+            <th>עניין</th>
+            <th>וואטסאפ</th>
+            <th>איכות ליד</th>
+            <th>סנטימנט</th>
+            <th>סיכום</th>
+            <th>מה הלקוח אמר</th>
         </tr>
-        {table_rows if table_rows else '<tr><td colspan="8">אין נתונים עדיין</td></tr>'}
+        {table_rows if table_rows else '<tr><td colspan="8">אין שיחות עדיין</td></tr>'}
     </table>
 </body>
-</html>"""
+</html>
+"""
 
     return Response(html, mimetype="text/html; charset=utf-8")
 
 # =========================
-# Run
+# Health
+# =========================
+@app.get("/")
+def home():
+    return jsonify({
+        "ok": True,
+        "service": "AI sales call bot",
+        "routes": ["/voice", "/dashboard", "/stats", "/test-whatsapp?to=+972..."]
+    })
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"ok": True})
+
+# =========================
+# Run local
 # =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
