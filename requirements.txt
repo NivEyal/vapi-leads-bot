@@ -10,3 +10,8 @@ google-auth
 google
 google-cloud-texttospeech
 requests
+fastapi
+uvicorn[standard]
+websockets
+
+
