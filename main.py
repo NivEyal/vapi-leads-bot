@@ -119,11 +119,11 @@ async def media_stream(websocket: WebSocket):
 
     try:
         async with websockets.connect(
-            xai_url,
-            additional_headers=headers,
-            ping_interval=20,
-            ping_timeout=20,
-        ) as xai_ws:
+    xai_url,
+    additional_headers=headers,
+    ping_interval=20,
+    ping_timeout=20,
+) as xai_ws:
             print("✅ Connected to xAI Realtime", flush=True)
 
             stream_sid = None
