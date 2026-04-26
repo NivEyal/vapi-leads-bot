@@ -1,20 +1,15 @@
 import os
 import json
-import asyncio
 import base64
+import asyncio
+import audioop
+import requests
 import websockets
 
 from fastapi import FastAPI, WebSocket, Request, Response
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 from twilio.rest import Client
-
-try:
-    import audioop
-except ImportError:
-    try:
-        from audioop_lts import audioop
-    except ImportError:
-        audioop = None
+from google.cloud import speech
 
 app = FastAPI()
 
@@ -26,6 +21,24 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "").strip()
 
 TWILIO_CLIENT = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+speech_client = speech.SpeechClient()
+
+SYSTEM_PROMPT = """
+אתה עוזר מכירות טלפוני בעברית.
+דבר קצר וטבעי.
+אם הלקוח מאשר: כן, בטח, סבבה, תשלח, אפשר, אוקיי, yes, yeah, ok, sure —
+זה אישור לשלוח וואטסאפ.
+אם הלקוח מסרב: לא, לא תודה, no —
+אל תשלח וואטסאפ.
+"""
+
+YES_WORDS = [
+    "כן", "בטח", "ברור", "סבבה", "אפשר", "תשלח", "שלח",
+    "אוקיי", "אוקי", "יאללה", "מעוניין", "אשמח",
+    "yes", "yeah", "yep", "ok", "okay", "sure", "send"
+]
+
+NO_WORDS = ["לא", "לא תודה", "לא מעוניין", "no", "nope", "no thanks"]
 
 
 def normalize_whatsapp_number(phone: str) -> str:
@@ -36,7 +49,6 @@ def normalize_whatsapp_number(phone: str) -> str:
 
     if phone.startswith("whatsapp:"):
         return phone
-
     if phone.startswith("0"):
         phone = "+972" + phone[1:]
     elif phone.startswith("972"):
@@ -47,52 +59,126 @@ def normalize_whatsapp_number(phone: str) -> str:
     return f"whatsapp:{phone}"
 
 
-def send_whatsapp_logic(to_number: str) -> bool:
-    if not to_number:
-        print("⚠️ No phone number", flush=True)
+def detect_interest(text: str) -> bool:
+    text = (text or "").lower().strip()
+
+    if any(w in text for w in NO_WORDS):
         return False
 
+    return any(w in text for w in YES_WORDS)
+
+
+def send_whatsapp(to_number: str) -> bool:
     try:
         from_number = TWILIO_WHATSAPP_FROM
         if from_number and not from_number.startswith("whatsapp:"):
             from_number = f"whatsapp:{from_number}"
 
-        to_number = normalize_whatsapp_number(to_number)
-
         TWILIO_CLIENT.messages.create(
             from_=from_number,
-            to=to_number,
-            body=(
-                "שלום! הנה הפרטים על העוזר הדיגיטלי ב-10 שקלים ליום. "
-                "נשמח לתאם שיחה קצרה."
-            ),
+            to=normalize_whatsapp_number(to_number),
+            body="היי! הנה הפרטים על העוזר הדיגיטלי ב-10 שקלים ליום. נשמח לתאם שיחה קצרה.",
         )
 
-        print(f"✅ WhatsApp sent to {to_number}", flush=True)
+        print("✅ WhatsApp sent", flush=True)
         return True
 
     except Exception as e:
-        print(f"❌ WhatsApp Error: {e}", flush=True)
+        print("❌ WhatsApp error:", e, flush=True)
         return False
+
+
+def google_stt_from_mulaw(mulaw_bytes: bytes) -> str:
+    audio = speech.RecognitionAudio(content=mulaw_bytes)
+
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
+        sample_rate_hertz=8000,
+        language_code="he-IL",
+        alternative_language_codes=["en-US"],
+        enable_automatic_punctuation=False,
+    )
+
+    response = speech_client.recognize(config=config, audio=audio)
+
+    texts = []
+    for result in response.results:
+        if result.alternatives:
+            texts.append(result.alternatives[0].transcript)
+
+    return " ".join(texts).strip()
+
+
+def grok_tts_ulaw(text: str) -> bytes:
+    url = "https://api.x.ai/v1/tts"
+
+    payload = {
+        "text": text,
+        "voice_id": "leo",
+        "language": "he",
+        "format": "mulaw",
+        "sample_rate": 8000,
+    }
+
+    res = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {XAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=20,
+    )
+
+    if res.status_code != 200:
+        raise RuntimeError(f"Grok TTS error {res.status_code}: {res.text[:300]}")
+
+    return res.content
+
+
+async def send_audio_to_twilio(websocket: WebSocket, stream_sid: str, audio_bytes: bytes):
+    """
+    Twilio expects base64 μ-law 8k audio chunks.
+    """
+    chunk_size = 160  # 20ms at 8k μ-law
+
+    for i in range(0, len(audio_bytes), chunk_size):
+        chunk = audio_bytes[i:i + chunk_size]
+        payload = base64.b64encode(chunk).decode("utf-8")
+
+        await websocket.send_json({
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {"payload": payload},
+        })
+
+        await asyncio.sleep(0.02)
+
+
+async def speak(websocket: WebSocket, stream_sid: str, text: str):
+    try:
+        audio = grok_tts_ulaw(text)
+        await send_audio_to_twilio(websocket, stream_sid, audio)
+    except Exception as e:
+        print("❌ TTS error:", e, flush=True)
 
 
 @app.get("/")
 def home():
     return {
         "ok": True,
-        "service": "Twilio Media Streams + Grok Realtime",
+        "service": "Twilio + Google STT + Grok Leo TTS",
         "base_url": BASE_URL,
-        "audioop": audioop is not None,
     }
 
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "healthy"}
+    return {"ok": True}
 
 
 @app.post("/voice")
-async def handle_voice(request: Request):
+async def voice(request: Request):
     form = await request.form()
     caller = form.get("From", "Unknown")
 
@@ -105,248 +191,87 @@ async def handle_voice(request: Request):
     connect.append(stream)
     resp.append(connect)
 
-    return Response(content=str(resp), media_type="application/xml")
+    return Response(str(resp), media_type="application/xml")
 
 
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     await websocket.accept()
-    print("🚀 Twilio WebSocket Connected", flush=True)
 
-    xai_url = "wss://api.x.ai/v1/realtime"
-    headers = {
-        "Authorization": f"Bearer {XAI_API_KEY}"
-    }
+    stream_sid = None
+    caller = None
+    audio_buffer = bytearray()
+    bot_spoke = False
+    whatsapp_sent = False
+    speaking = False
+
+    print("🚀 Twilio WebSocket connected", flush=True)
 
     try:
-        async with websockets.connect(
-            xai_url,
-            additional_headers=headers,
-            ping_interval=20,
-            ping_timeout=20,
-        ) as xai_ws:
-            print("✅ Connected to xAI Realtime", flush=True)
+        async for message in websocket.iter_text():
+            data = json.loads(message)
+            event = data.get("event")
 
-            stream_sid = None
-            phone_number = None
-            resample_state = None
-            whatsapp_sent_once = False
+            if event == "start":
+                stream_sid = data["start"]["streamSid"]
+                caller = data["start"]["customParameters"].get("caller")
 
-            session_update = {
-                "type": "session.update",
-                "session": {
-                    "input_audio_transcription": {
-                        "model": "grok-speech",
-                        "language": "he-IL"
-                    },
-                    "modalities": ["audio", "text"],
-                    "instructions": """
-אתה עוזר דיגיטלי עסקי בשם גרוק.
+                print("📞 Call from:", caller, flush=True)
 
-חובה לדבר בעברית טבעית וקצרה.
+                await speak(
+                    websocket,
+                    stream_sid,
+                    "שלום, אני עוזר דיגיטלי ב-10 שקלים ליום. תרצה שאשלח לך פרטים בוואטסאפ?"
+                )
 
-משפט פתיחה:
-אמור בדיוק:
-"שלום, אני עוזר דיגיטלי שעוזר לעסקים לנהל שיחות ב-10 שקלים ליום. תרצה שאשלח לך פרטים בוואטסאפ?"
+                bot_spoke = True
+                audio_buffer.clear()
 
-זיהוי אישור:
-אם הלקוח אומר אחד מהבאים:
-כן, בטח, ברור, סבבה, אפשר, תשלח, שלח, אוקיי, אוקי, יאללה, מעוניין, אשמח
-או באנגלית:
-yes, yeah, yep, ok, okay, sure, send
+            elif event == "media":
+                if not bot_spoke or speaking:
+                    continue
 
-זה נחשב אישור.
+                payload = data["media"]["payload"]
+                chunk = base64.b64decode(payload)
 
-כאשר יש אישור:
-1. חובה להפעיל מיד את הכלי send_whatsapp.
-2. רק אחרי שהכלי הופעל, אמור:
-"מעולה, שלחתי לך עכשיו הודעה בוואטסאפ."
+                audio_buffer.extend(chunk)
 
-אם הלקוח אומר:
-לא, לא תודה, לא מעוניין, no, nope, no thanks
-אז אל תפעיל את הכלי ואמור:
-"אין בעיה, תודה ולהתראות."
+                # בערך 1.8 שניות אודיו: 8000 bytes/sec μ-law
+                if len(audio_buffer) >= 14500:
+                    current_audio = bytes(audio_buffer)
+                    audio_buffer.clear()
 
-אם לא ברור:
-שאל:
-"רק לוודא, לשלוח לך פרטים בוואטסאפ?"
+                    try:
+                        text = google_stt_from_mulaw(current_audio)
+                        print("🧠 GOOGLE STT:", repr(text), flush=True)
+                    except Exception as e:
+                        print("❌ Google STT error:", e, flush=True)
+                        continue
 
-אל תאמר ששלחת וואטסאפ אם לא הפעלת את הכלי.
-אל תנתק לפני שסיימת לדבר.
-""",
-                    "voice": "leo",
-                    "input_audio_format": "g711_ulaw",
-                    "output_audio_format": "pcm16",
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.25,
-                        "prefix_padding_ms": 500,
-                        "silence_duration_ms": 500,
-                    },
-                    "tools": [
-                        {
-                            "type": "function",
-                            "name": "send_whatsapp",
-                            "description": "שולח הודעת וואטסאפ עם פרטים ללקוח אחרי שהלקוח אישר בקול.",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {},
-                            },
-                        }
-                    ],
-                },
-            }
+                    if not text:
+                        continue
 
-            await xai_ws.send(json.dumps(session_update))
+                    if detect_interest(text):
+                        if not whatsapp_sent:
+                            whatsapp_sent = send_whatsapp(caller)
 
-            async def xai_to_twilio():
-                nonlocal stream_sid, resample_state, whatsapp_sent_once
+                        if whatsapp_sent:
+                            await speak(websocket, stream_sid, "מעולה, שלחתי לך עכשיו הודעה בוואטסאפ.")
+                        else:
+                            await speak(websocket, stream_sid, "מעולה, קיבלתי אישור. הייתה בעיה בשליחת הוואטסאפ, אבל שמרתי את הפרטים.")
 
-                async for message in xai_ws:
-                    response = json.loads(message)
-                    event_type = response.get("type")
-
-                    print("XAI EVENT:", event_type, flush=True)
-
-                    if "transcript" in response:
-                        print("🧠 TRANSCRIPT:", response.get("transcript"), flush=True)
-
-                    if event_type in [
-                        "conversation.item.input_audio_transcription.completed",
-                        "input_audio_transcription.completed",
-                    ]:
-                        print("🧠 USER TRANSCRIPT FULL:", response, flush=True)
-
-                    if event_type == "error":
-                        print("❌ XAI ERROR:", response, flush=True)
-
-                    if event_type == "input_audio_buffer.speech_started" and stream_sid:
-                        await websocket.send_json({
-                            "event": "clear",
-                            "streamSid": stream_sid,
-                        })
-
-                    if event_type in ["response.audio.delta", "response.output_audio.delta"]:
-                        payload = response.get("delta") or response.get("audio")
-
-                        if payload and stream_sid and audioop:
-                            try:
-                                pcm_data = base64.b64decode(payload)
-
-                                resampled_data, resample_state = audioop.ratecv(
-                                    pcm_data,
-                                    2,
-                                    1,
-                                    24000,
-                                    8000,
-                                    resample_state,
-                                )
-
-                                mu_law_data = audioop.lin2ulaw(resampled_data, 2)
-                                encoded_payload = base64.b64encode(mu_law_data).decode("utf-8")
-
-                                await websocket.send_json({
-                                    "event": "media",
-                                    "streamSid": stream_sid,
-                                    "media": {
-                                        "payload": encoded_payload,
-                                    },
-                                })
-
-                            except Exception as e:
-                                print(f"🔥 Audio processing error: {e}", flush=True)
-
-                    if event_type == "response.function_call_arguments.done":
-                        name = response.get("name")
-                        call_id = response.get("call_id")
-
-                        print("🛠️ TOOL CALL:", name, call_id, flush=True)
-
-                        if name == "send_whatsapp":
-                            if not whatsapp_sent_once:
-                                ok = send_whatsapp_logic(phone_number)
-                                whatsapp_sent_once = True
-                            else:
-                                ok = True
-
-                            await xai_ws.send(json.dumps({
-                                "type": "conversation.item.create",
-                                "item": {
-                                    "type": "function_call_output",
-                                    "call_id": call_id,
-                                    "output": "success" if ok else "failed",
-                                },
-                            }))
-
-                            await xai_ws.send(json.dumps({
-                                "type": "response.create"
-                            }))
-
-            async def twilio_to_xai():
-                nonlocal stream_sid, phone_number
-
-                async for message in websocket.iter_text():
-                    data = json.loads(message)
-                    event = data.get("event")
-
-                    if event == "connected":
-                        print("🔌 Twilio connected", flush=True)
-
-                    elif event == "start":
-                        stream_sid = data["start"]["streamSid"]
-                        phone_number = data["start"]["customParameters"].get("caller")
-
-                        print(f"📞 Call started from {phone_number} | {stream_sid}", flush=True)
-
-                        greeting_text = (
-                            "אמור בדיוק את המשפט הבא בלי לשנות כלום: "
-                            "שלום, אני עוזר דיגיטלי שעוזר לעסקים לנהל שיחות ב-10 שקלים ליום. "
-                            "תרצה שאשלח לך פרטים בוואטסאפ?"
-                        )
-
-                        greeting = {
-                            "type": "conversation.item.create",
-                            "item": {
-                                "type": "message",
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "input_text",
-                                        "text": greeting_text,
-                                    }
-                                ],
-                            },
-                        }
-
-                        await xai_ws.send(json.dumps(greeting))
-                        await xai_ws.send(json.dumps({"type": "response.create"}))
-
-                    elif event == "media":
-                        payload = data["media"]["payload"]
-
-                        print(
-                            "🎙️ TWILIO MEDIA:",
-                            len(payload),
-                            payload[:10],
-                            flush=True
-                        )
-
-                        await xai_ws.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": payload,
-                        }))
-
-                    elif event in ["stop", "close"]:
-                        print("⏹️ Twilio stream stopped", flush=True)
                         break
 
-            await asyncio.gather(
-                xai_to_twilio(),
-                twilio_to_xai(),
-            )
+                    else:
+                        await speak(websocket, stream_sid, "רק לוודא, לשלוח לך פרטים בוואטסאפ?")
+                        audio_buffer.clear()
+
+            elif event in ["stop", "close"]:
+                print("⏹️ Twilio stream stopped", flush=True)
+                break
 
     except Exception as e:
-        print(f"🔥 ERROR: {e}", flush=True)
+        print("🔥 WS error:", e, flush=True)
 
     finally:
         try:
