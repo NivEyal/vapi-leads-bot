@@ -9,7 +9,6 @@ import websockets
 from fastapi import FastAPI, WebSocket, Request, Response
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 from twilio.rest import Client
-from google.cloud import speech
 
 app = FastAPI()
 
@@ -21,7 +20,6 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "").strip()
 
 TWILIO_CLIENT = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-speech_client = speech.SpeechClient()
 
 SYSTEM_PROMPT = """
 אתה עוזר מכירות טלפוני בעברית.
@@ -89,22 +87,41 @@ def send_whatsapp(to_number: str) -> bool:
 
 
 def google_stt_from_mulaw(mulaw_bytes: bytes) -> str:
-    audio = speech.RecognitionAudio(content=mulaw_bytes)
+    url = "https://speech.googleapis.com/v1/speech:recognize"
 
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
-        sample_rate_hertz=8000,
-        language_code="he-IL",
-        alternative_language_codes=["en-US"],
-        enable_automatic_punctuation=False,
+    audio_base64 = base64.b64encode(mulaw_bytes).decode("utf-8")
+
+    payload = {
+        "config": {
+            "encoding": "MULAW",
+            "sampleRateHertz": 8000,
+            "languageCode": "he-IL",
+            "alternativeLanguageCodes": ["en-US"],
+            "enableAutomaticPunctuation": False,
+        },
+        "audio": {
+            "content": audio_base64
+        }
+    }
+
+    res = requests.post(
+        f"{url}?key={os.getenv('GOOGLE_API_KEY')}",
+        json=payload,
+        timeout=15,
     )
 
-    response = speech_client.recognize(config=config, audio=audio)
+    if res.status_code != 200:
+        print("❌ Google STT HTTP error:", res.text[:500], flush=True)
+        return ""
+
+    data = res.json()
+    results = data.get("results", [])
 
     texts = []
-    for result in response.results:
-        if result.alternatives:
-            texts.append(result.alternatives[0].transcript)
+    for result in results:
+        alternatives = result.get("alternatives", [])
+        if alternatives:
+            texts.append(alternatives[0].get("transcript", ""))
 
     return " ".join(texts).strip()
 
