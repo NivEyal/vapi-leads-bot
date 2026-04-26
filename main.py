@@ -82,6 +82,7 @@ def home():
         "ok": True,
         "service": "Twilio Media Streams + Grok Realtime",
         "base_url": BASE_URL,
+        "audioop": audioop is not None,
     }
 
 
@@ -119,11 +120,11 @@ async def media_stream(websocket: WebSocket):
 
     try:
         async with websockets.connect(
-    xai_url,
-    additional_headers=headers,
-    ping_interval=20,
-    ping_timeout=20,
-) as xai_ws:
+            xai_url,
+            additional_headers=headers,
+            ping_interval=20,
+            ping_timeout=20,
+        ) as xai_ws:
             print("✅ Connected to xAI Realtime", flush=True)
 
             stream_sid = None
@@ -134,6 +135,10 @@ async def media_stream(websocket: WebSocket):
             session_update = {
                 "type": "session.update",
                 "session": {
+                    "input_audio_transcription": {
+                        "model": "grok-speech",
+                        "language": "he-IL"
+                    },
                     "modalities": ["audio", "text"],
                     "instructions": """
 אתה עוזר דיגיטלי עסקי בשם גרוק.
@@ -142,7 +147,7 @@ async def media_stream(websocket: WebSocket):
 
 משפט פתיחה:
 אמור בדיוק:
-"שלום, אני עוזר דיגיטלי ב-10 שקלים ליום. תרצה שאשלח לך פרטים בוואטסאפ?"
+"שלום, אני עוזר דיגיטלי שעוזר לעסקים לנהל שיחות ב-10 שקלים ליום. תרצה שאשלח לך פרטים בוואטסאפ?"
 
 זיהוי אישור:
 אם הלקוח אומר אחד מהבאים:
@@ -174,9 +179,9 @@ yes, yeah, yep, ok, okay, sure, send
                     "output_audio_format": "pcm16",
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.4,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 800,
+                        "threshold": 0.25,
+                        "prefix_padding_ms": 500,
+                        "silence_duration_ms": 500,
                     },
                     "tools": [
                         {
@@ -215,14 +220,12 @@ yes, yeah, yep, ok, okay, sure, send
                     if event_type == "error":
                         print("❌ XAI ERROR:", response, flush=True)
 
-                    # Barge-in
                     if event_type == "input_audio_buffer.speech_started" and stream_sid:
                         await websocket.send_json({
                             "event": "clear",
                             "streamSid": stream_sid,
                         })
 
-                    # Audio: xAI pcm16 24khz -> Twilio mulaw 8khz
                     if event_type in ["response.audio.delta", "response.output_audio.delta"]:
                         payload = response.get("delta") or response.get("audio")
 
@@ -253,7 +256,6 @@ yes, yeah, yep, ok, okay, sure, send
                             except Exception as e:
                                 print(f"🔥 Audio processing error: {e}", flush=True)
 
-                    # Tool call: send WhatsApp
                     if event_type == "response.function_call_arguments.done":
                         name = response.get("name")
                         call_id = response.get("call_id")
@@ -298,7 +300,7 @@ yes, yeah, yep, ok, okay, sure, send
 
                         greeting_text = (
                             "אמור בדיוק את המשפט הבא בלי לשנות כלום: "
-                            "שלום, אני עוזר דיגיטלי ב-10 שקלים ליום. "
+                            "שלום, אני עוזר דיגיטלי שעוזר לעסקים לנהל שיחות ב-10 שקלים ליום. "
                             "תרצה שאשלח לך פרטים בוואטסאפ?"
                         )
 
@@ -320,9 +322,18 @@ yes, yeah, yep, ok, okay, sure, send
                         await xai_ws.send(json.dumps({"type": "response.create"}))
 
                     elif event == "media":
+                        payload = data["media"]["payload"]
+
+                        print(
+                            "🎙️ TWILIO MEDIA:",
+                            len(payload),
+                            payload[:10],
+                            flush=True
+                        )
+
                         await xai_ws.send(json.dumps({
                             "type": "input_audio_buffer.append",
-                            "audio": data["media"]["payload"],
+                            "audio": payload,
                         }))
 
                     elif event in ["stop", "close"]:
