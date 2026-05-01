@@ -72,26 +72,48 @@ def detect_interest(text: str) -> bool:
 
 
 def send_whatsapp(to_number: str) -> bool:
+    """
+    שולחת הודעת וואטסאפ באמצעות ה-API של מטה תוך שימוש בשמות משתנים של Twilio.
+    """
     try:
-        from_number = TWILIO_WHATSAPP_FROM
+        # ניקוי מספר היעד לפורמט בינלאומי נקי (למשל 972501234567)
+        clean_to = to_number.replace("whatsapp:", "").replace("+", "").replace(" ", "").strip()
+        if clean_to.startswith("0"):
+            clean_to = "972" + clean_to[1:]
 
-        if from_number and not from_number.startswith("whatsapp:"):
-            from_number = f"whatsapp:{from_number}"
+        # בניית ה-URL באמצעות ה-Phone Number ID שנשמר ב-TWILIO_ACCOUNT_SID
+        url = f"https://graph.facebook.com/v18.0/{TWILIO_ACCOUNT_SID}/messages"
+        
+        headers = {
+            "Authorization": f"Bearer {TWILIO_AUTH_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        
+        # מבנה ה-Payload עבור ה-API הרשמי של מטה
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": clean_to,
+            "type": "template",
+            "template": {
+                "name": TEMPLATE_NAME,
+                "language": {
+                    "code": "he" # שפת התבנית (עברית)
+                }
+            }
+        }
 
-        TWILIO_CLIENT.messages.create(
-            from_=from_number,
-            to=normalize_whatsapp_number(to_number),
-            body=(
-                "היי! הנה הפרטים על העוזר הדיגיטלי ב-10 שקלים ליום. "
-                "נשמח לתאם שיחה קצרה."
-            ),
-        )
-
-        print("✅ WhatsApp sent", flush=True)
-        return True
+        # ביצוע השליחה
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        
+        if response.status_code in [200, 201]:
+            print(f"✅ WhatsApp sent via Meta to {clean_to}", flush=True)
+            return True
+        else:
+            print(f"❌ Meta API Error: {response.status_code} - {response.text}", flush=True)
+            return False
 
     except Exception as e:
-        print("❌ WhatsApp error:", e, flush=True)
+        print(f"🔥 Critical error in send_whatsapp: {e}", flush=True)
         return False
 
 
