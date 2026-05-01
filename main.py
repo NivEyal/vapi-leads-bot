@@ -295,6 +295,20 @@ async def failed():
 
     return Response(str(resp), media_type="application/xml")
 
+@app.get("/webhook")
+async def verify_webhook(request: Request):
+    # קבלת הפרמטרים שמטה שולחת לצורך אימות ה-Webhook
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    # בדיקה שהטוקן תואם לערך שהגדרת ב-Render
+    if mode == "subscribe" and token == os.getenv("VERIFY_TOKEN"):
+        print("✅ Webhook verified successfully!", flush=True)
+        return Response(content=challenge, media_type="text/plain")
+    
+    print("❌ Webhook verification failed", flush=True)
+    return Response(content="Forbidden", status_code=403)
 
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
